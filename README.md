@@ -42,6 +42,54 @@ GitHub release. The LoongArch build uses the upstream Linux LP64D ABI (kernel
 vendored and statically linked so the executable does not require a system
 OpenSSL installation.
 
+## REST Server and Web Console
+
+The embedded server exposes the existing one-shot core operations through
+JSON, manages configured sync folders, and automatically serves the bundled
+web console:
+
+```bash
+cargo run -- serve-ui --listen 127.0.0.1:8787 \
+  --state .rustsync-server/state.json
+```
+
+Open `http://127.0.0.1:8787/`. The server binds to loopback by default and
+stores its password hash, access rules, and folder registry in the state file
+with mode `0600`.
+
+When no password is configured, the first trusted client can complete initial
+setup. After a password is set, requests from non-exempt clients require either
+the `Authorization: Bearer <token>` header or the `rustsync_session` cookie
+issued by `POST /api/v1/auth/login`. Local access is exempt by default:
+
+```text
+127.0.0.0/8
+::1/128
+```
+
+The exempt list is configurable as individual IPs or CIDR networks. The server
+uses the direct socket peer address and deliberately does not trust forwarded
+headers.
+
+One-shot CLI commands can execute on a running server with `--server`. Supply
+`--server-token`, or use `--server-password` to log in first:
+
+```bash
+cargo run -- --server http://127.0.0.1:8787 scan /srv/sync/docs
+cargo run -- --server http://127.0.0.1:8787 \
+  --server-password 'change-me' generate-key --read-write
+```
+
+Set `RUSTSYNC_SERVER`, plus `RUSTSYNC_SERVER_TOKEN` or
+`RUSTSYNC_SERVER_PASSWORD`, to make server dispatch the normal path for
+automation and scheduled jobs.
+
+`scan`, `apply`, `pull`, key generation/inspection, discovery ping encoding,
+encrypt/decrypt, and tracker announce run in the server process through the
+same Rust core functions as local mode. Long-running listeners remain local
+commands because they own their sockets and daemon lifetime. See
+[`docs/REST_API.md`](docs/REST_API.md) for endpoint contracts.
+
 Scan and atomically apply a tree with the standalone core:
 
 ```bash
