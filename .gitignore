@@ -9,3 +9,9 @@ compat-work/
 .env
 .rustsync-manifest.json
 .rustsync-staging-*
+android/.gradle/
+android/build/
+android/local.properties
+android/app/build/
+android/app/src/main/jniLibs/
+android/keystore.properties

@@ -71,6 +71,16 @@ The exempt list is configurable as individual IPs or CIDR networks. The server
 uses the direct socket peer address and deliberately does not trust forwarded
 headers.
 
+## Android client
+
+The repository includes a native Android client in [`android/`](android/).
+It packages the `rustsync` executable for `arm64-v8a`, `armeabi-v7a`, `x86`,
+and `x86_64`, launches the embedded REST server, and provides tools for every
+CLI operation. Folder registration supports app-private storage, native
+absolute paths, external app storage, and SAF document trees through a
+bidirectional app-private mirror. The Android workflow publishes installable
+APK artifacts on every CI run and attaches them to version-tag releases.
+
 One-shot CLI commands can execute on a running server with `--server`. Supply
 `--server-token`, or use `--server-password` to log in first:
 
