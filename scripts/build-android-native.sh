@@ -42,9 +42,10 @@ for entry in "${targets[@]}"; do
     target_env_upper="$(tr '[:lower:]-' '[:upper:]_' <<< "$rust_target")"
     export "CC_${target_env_lower}=$toolchain/$clang_name"
     export "AR_${target_env_lower}=$toolchain/llvm-ar"
+    export "RANLIB_${target_env_lower}=$toolchain/llvm-ranlib"
     export "CARGO_TARGET_${target_env_upper}_LINKER=$toolchain/$clang_name"
     export OPENSSL_STATIC=1
-        CARGO_TARGET_DIR="$repo_root/target/android" \
+    CARGO_TARGET_DIR="$repo_root/target/android" \
         cargo build --locked --release --target "$rust_target"
     source_binary="$repo_root/target/android/$rust_target/release/rustsync"
     destination="$repo_root/android/app/src/main/jniLibs/$abi/librustsync.so"
