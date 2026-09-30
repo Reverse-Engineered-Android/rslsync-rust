@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RustSync Server</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>RustSync Server</h1>
+        <p>文件同步服务控制台</p>
+      </div>
+      <div class="topbar-actions">
+        <span id="connection" class="status-badge">连接中</span>
+        <button id="logout-button" class="icon-button hidden" type="button" title="退出登录" aria-label="退出登录">↪</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="login-view" class="login-view hidden" aria-labelledby="login-title">
+        <form id="login-form" class="login-panel">
+          <h2 id="login-title">登录服务器</h2>
+          <label>
+            密码
+            <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+          </label>
+          <button class="primary-button" type="submit">登录</button>
+          <p id="login-error" class="error-text" role="alert"></p>
+        </form>
+      </section>
+
+      <div id="workspace" class="workspace hidden">
+        <section class="settings-band" aria-labelledby="settings-title">
+          <div class="section-heading">
+            <div>
+              <h2 id="settings-title">访问设置</h2>
+              <p>设置访问密码，并指定无需密码的客户端 IP 或 CIDR。</p>
+            </div>
+            <span id="password-state" class="status-badge">未设置密码</span>
+          </div>
+
+          <form id="settings-form" class="settings-grid">
+            <label>
+              新密码
+              <input id="password" type="password" autocomplete="new-password" minlength="8" placeholder="留空则不修改">
+            </label>
+            <label>
+              确认新密码
+              <input id="password-confirm" type="password" autocomplete="new-password" minlength="8" placeholder="再次输入新密码">
+            </label>
+            <label class="full-width">
+              免密客户端 IP / CIDR
+              <textarea id="exempt-ips" rows="3" spellcheck="false" placeholder="每行一个，例如：127.0.0.0/8"></textarea>
+            </label>
+            <div class="form-actions full-width">
+              <button class="primary-button" type="submit">保存设置</button>
+              <button id="clear-password-button" class="danger-button" type="button">清除密码</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="folder-band" aria-labelledby="folders-title">
+          <div class="section-heading">
+            <div>
+              <h2 id="folders-title">同步文件夹</h2>
+              <p>注册服务器可扫描的目录，并维护包含与排除规则。</p>
+            </div>
+            <button id="refresh-folders-button" class="icon-button" type="button" title="刷新文件夹" aria-label="刷新文件夹">↻</button>
+          </div>
+
+          <form id="folder-form" class="folder-form">
+            <input id="folder-id" type="hidden">
+            <label>
+              名称
+              <input id="folder-name" required maxlength="120" placeholder="例如：Documents">
+            </label>
+            <label class="path-field">
+              服务器绝对路径
+              <input id="folder-path" required spellcheck="false" placeholder="/srv/sync/documents">
+            </label>
+            <label>
+              包含规则
+              <input id="folder-include" spellcheck="false" placeholder="可选，逗号分隔">
+            </label>
+            <label>
+              排除规则
+              <input id="folder-exclude" spellcheck="false" placeholder="可选，逗号分隔">
+            </label>
+            <div class="folder-form-actions">
+              <button id="folder-submit-button" class="primary-button" type="submit">添加文件夹</button>
+              <button id="folder-cancel-button" class="secondary-button hidden" type="button">取消编辑</button>
+            </div>
+          </form>
+
+          <div id="folder-list" class="folder-list" aria-live="polite"></div>
+        </section>
+
+        <section class="tools-band" aria-labelledby="tools-title">
+          <div class="section-heading">
+            <div>
+              <h2 id="tools-title">密钥工具</h2>
+              <p>生成或检查 rustsync 兼容共享密钥。</p>
+            </div>
+          </div>
+          <div class="tools-grid">
+            <form id="generate-key-form">
+              <label class="checkbox-label">
+                <input id="read-write-key" type="checkbox">
+                生成可写 A 密钥
+              </label>
+              <button class="secondary-button" type="submit">生成密钥</button>
+            </form>
+            <form id="inspect-key-form">
+              <label>
+                共享密钥
+                <input id="inspect-key-value" required spellcheck="false" autocomplete="off">
+              </label>
+              <button class="secondary-button" type="submit">检查密钥</button>
+            </form>
+            <pre id="tool-output" class="tool-output" aria-live="polite">工具结果会显示在这里。</pre>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -8,12 +8,14 @@ repository = "https://github.com/Reverse-Engineered-Android/rustsync"
 
 [dependencies]
 anyhow = "1.0"
+argon2 = { version = "0.5", features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 filetime = "0.2"
 flate2 = "1.1.4"
 fs2 = "0.4"
 hex = "0.4"
+ipnet = "2.10"
 openssl = "0.10.81"
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
@@ -21,6 +23,7 @@ serde_json = "1.0"
 sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "1.0"
+tiny_http = "0.12"
 walkdir = "2.5"
 
 [dev-dependencies]

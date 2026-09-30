@@ -1,13 +1,19 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rustsync::apply::{apply_manifest_with_policy, ApplyPolicy, ConflictPolicy};
+use rustsync::client::RemoteClient;
 use rustsync::discovery::LanPing;
 use rustsync::encrypted::{decrypt_tree, encrypt_tree};
+use rustsync::operations::{
+    ApplyRequest, DecryptTreeRequest, EncodePingRequest, EncryptTreeRequest, GenerateKeyRequest,
+    InspectKeyRequest, PullRequest, ScanRequest, TrackerAnnounceRequest,
+};
 use rustsync::peer::{pull, random_peer_id, serve_once};
 use rustsync::permissions::PermissionPolicy;
 use rustsync::scan::{manifest_path, scan_root_with_selection};
 use rustsync::secret::ShareKey;
 use rustsync::selective::SyncSelection;
+use rustsync::server::{ServerOptions, WebServer};
 use rustsync::sync_session::SyncNode;
 use rustsync::tracker::{TrackerClient, TrackerRequest, TrackerServer};
 use std::fs;
@@ -17,12 +23,28 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Send one-shot CLI operations to a rustsync REST server.
+    #[arg(long)]
+    server: Option<String>,
+    /// Bearer token for the REST server.
+    #[arg(long)]
+    server_token: Option<String>,
+    /// Password used to log in to the REST server.
+    #[arg(long)]
+    server_password: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve the embedded REST API and web interface.
+    ServeUi {
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: String,
+        #[arg(long, default_value = ".rustsync-server/state.json")]
+        state: PathBuf,
+    },
     /// Scan a directory and write a deterministic JSON manifest.
     Scan {
         root: PathBuf,
@@ -148,7 +170,32 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let server = cli
+        .server
+        .or_else(|| std::env::var("RUSTSYNC_SERVER").ok())
+        .filter(|value| !value.trim().is_empty());
+    let server_token = cli
+        .server_token
+        .or_else(|| std::env::var("RUSTSYNC_SERVER_TOKEN").ok())
+        .filter(|value| !value.trim().is_empty());
+    let server_password = cli
+        .server_password
+        .or_else(|| std::env::var("RUSTSYNC_SERVER_PASSWORD").ok())
+        .filter(|value| !value.trim().is_empty());
+    if let Some(server) = server {
+        let mut client = RemoteClient::new(&server, server_token, server_password)?;
+        return run_remote(&mut client, cli.command);
+    }
+    match cli.command {
+        Command::ServeUi { listen, state } => {
+            let server = WebServer::bind(ServerOptions::new(listen, state))?;
+            eprintln!(
+                "rustsync server listening on http://{}",
+                server.local_addr()?
+            );
+            server.serve_forever()?;
+        }
         Command::Scan {
             root,
             output,
@@ -348,6 +395,163 @@ fn main() -> Result<()> {
             let server = TrackerServer::bind(&listen)?;
             eprintln!("tracker listening on {}", server.local_addr()?);
             server.serve_forever()?;
+        }
+    }
+    Ok(())
+}
+
+fn run_remote(client: &mut RemoteClient, command: Command) -> Result<()> {
+    match command {
+        Command::ServeUi { .. } => bail!("serve-ui always runs on the local host"),
+        Command::Scan {
+            root,
+            output,
+            include,
+            exclude,
+        } => {
+            let response: rustsync::operations::ScanResponse = client.call(
+                "POST",
+                "/api/v1/operations/scan",
+                Some(&ScanRequest {
+                    root,
+                    output,
+                    include,
+                    exclude,
+                }),
+            )?;
+            println!(
+                "{} {}",
+                response.summary.root_hash,
+                response.summary.output.unwrap_or_default().display()
+            );
+        }
+        Command::Apply {
+            source,
+            target,
+            manifest,
+            conflict,
+            permissions,
+        } => {
+            let response: rustsync::operations::ApplyResponse = client.call(
+                "POST",
+                "/api/v1/operations/apply",
+                Some(&ApplyRequest {
+                    source,
+                    target,
+                    manifest,
+                    conflict: Some(conflict),
+                    permissions: Some(permissions),
+                }),
+            )?;
+            println!("{} {}", response.root_hash, response.target.display());
+        }
+        Command::Pull {
+            address,
+            target,
+            key,
+        } => {
+            let response: rustsync::operations::PullResponse = client.call(
+                "POST",
+                "/api/v1/operations/pull",
+                Some(&PullRequest {
+                    address,
+                    target,
+                    key,
+                }),
+            )?;
+            println!("{} {}", response.root_hash, response.target.display());
+        }
+        Command::GenerateKey { read_write } => {
+            let response: rustsync::operations::GenerateKeyResponse = client.call(
+                "POST",
+                "/api/v1/operations/keys/generate",
+                Some(&GenerateKeyRequest { read_write }),
+            )?;
+            println!("{}", response.key);
+        }
+        Command::InspectKey { key } => {
+            let response: serde_json::Value = client.call(
+                "POST",
+                "/api/v1/operations/keys/inspect",
+                Some(&InspectKeyRequest { key }),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        Command::EncodePing {
+            peer_id,
+            port,
+            share_ids,
+        } => {
+            let response: rustsync::operations::EncodePingResponse = client.call(
+                "POST",
+                "/api/v1/operations/ping/encode",
+                Some(&EncodePingRequest {
+                    peer_id,
+                    port,
+                    share_ids,
+                }),
+            )?;
+            println!("{}", response.packet_hex);
+        }
+        Command::EncryptTree {
+            source,
+            destination,
+            passphrase,
+        } => {
+            let response: rustsync::operations::VaultResponse = client.call(
+                "POST",
+                "/api/v1/operations/vault/encrypt",
+                Some(&EncryptTreeRequest {
+                    source,
+                    destination,
+                    passphrase,
+                }),
+            )?;
+            println!("{} {}", response.file_count, response.destination.display());
+        }
+        Command::DecryptTree {
+            source,
+            destination,
+            passphrase,
+        } => {
+            let response: rustsync::operations::VaultResponse = client.call(
+                "POST",
+                "/api/v1/operations/vault/decrypt",
+                Some(&DecryptTreeRequest {
+                    source,
+                    destination,
+                    passphrase,
+                }),
+            )?;
+            println!("{} {}", response.file_count, response.destination.display());
+        }
+        Command::TrackerAnnounce {
+            url,
+            info_hash,
+            peer_id,
+            port,
+        } => {
+            let response: serde_json::Value = client.call(
+                "POST",
+                "/api/v1/operations/tracker/announce",
+                Some(&TrackerAnnounceRequest {
+                    url,
+                    info_hash,
+                    peer_id,
+                    port,
+                    uploaded: 0,
+                    downloaded: 0,
+                    left: 0,
+                    event: Some("started".into()),
+                }),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        Command::Serve { .. }
+        | Command::ServeUpstream { .. }
+        | Command::ConnectUpstream { .. }
+        | Command::TrackerServe { .. } => {
+            bail!("long-running listeners are managed locally; run this command without --server")
         }
     }
     Ok(())
