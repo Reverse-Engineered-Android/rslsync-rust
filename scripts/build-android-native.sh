@@ -27,15 +27,25 @@ toolchain="$NDK/toolchains/llvm/prebuilt/$host_tag/bin"
 api_level="${ANDROID_API_LEVEL:-21}"
 export ANDROID_NDK_HOME="$NDK"
 export ANDROID_NDK_ROOT="$NDK"
+clang_lib_dir="$(ls -d "$NDK"/toolchains/llvm/prebuilt/"$host_tag"/lib/clang/*/lib/linux 2>/dev/null | sort -V | tail -1)"
+if [[ -z "$clang_lib_dir" ]]; then
+    echo "clang runtime directory not found under $NDK" >&2
+    exit 1
+fi
+
+# The 32-bit ABIs need the compiler runtime archive: the vendored OpenSSL
+# static libraries call the __atomic_* helpers, and the NDK's libatomic.a is
+# only a stub pointing at compiler-rt. rustc links with -nodefaultlibs, which
+# suppresses the clang runtime archive that would otherwise provide them.
 targets=(
-    "aarch64-linux-android arm64-v8a aarch64-linux-android${api_level}-clang"
-    "armv7-linux-androideabi armeabi-v7a armv7a-linux-androideabi${api_level}-clang"
-    "i686-linux-android x86 i686-linux-android${api_level}-clang"
-    "x86_64-linux-android x86_64 x86_64-linux-android${api_level}-clang"
+    "aarch64-linux-android|arm64-v8a|aarch64-linux-android${api_level}-clang|"
+    "armv7-linux-androideabi|armeabi-v7a|armv7a-linux-androideabi${api_level}-clang|arm"
+    "i686-linux-android|x86|i686-linux-android${api_level}-clang|i686"
+    "x86_64-linux-android|x86_64|x86_64-linux-android${api_level}-clang|"
 )
 
 for entry in "${targets[@]}"; do
-    read -r rust_target abi clang_name <<< "$entry"
+    IFS='|' read -r rust_target abi clang_name builtins_arch <<< "$entry"
     echo "==> rustsync $rust_target -> $abi"
     rustup target add "$rust_target"
     target_env_lower="$(tr '[:upper:]-' '[:lower:]_' <<< "$rust_target")"
@@ -44,6 +54,20 @@ for entry in "${targets[@]}"; do
     export "AR_${target_env_lower}=$toolchain/llvm-ar"
     export "RANLIB_${target_env_lower}=$toolchain/llvm-ranlib"
     export "CARGO_TARGET_${target_env_upper}_LINKER=$toolchain/$clang_name"
+    extra_flags=()
+    if [[ -n "$builtins_arch" ]]; then
+        builtins_archive="$clang_lib_dir/libclang_rt.builtins-${builtins_arch}-android.a"
+        if [[ ! -f "$builtins_archive" ]]; then
+            echo "compiler runtime archive not found: $builtins_archive" >&2
+            exit 1
+        fi
+        extra_flags+=("-C" "link-arg=$builtins_archive")
+    fi
+    if (( ${#extra_flags[@]} > 0 )); then
+        export "CARGO_TARGET_${target_env_upper}_RUSTFLAGS=${extra_flags[*]}"
+    else
+        unset "CARGO_TARGET_${target_env_upper}_RUSTFLAGS"
+    fi
     export OPENSSL_STATIC=1
     CARGO_TARGET_DIR="$repo_root/target/android" \
         cargo build --locked --release --target "$rust_target"
