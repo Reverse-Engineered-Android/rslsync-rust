@@ -47,7 +47,7 @@ jobs:
           fi
 
           tag=""
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
             tag="$GITHUB_REF_NAME"
           elif [[ -n "${REQUESTED_TAG:-}" ]]; then
             tag="$REQUESTED_TAG"
