@@ -2,6 +2,8 @@ name: release
 
 on:
   push:
+    branches:
+      - "**"
     tags:
       - "v*"
   workflow_dispatch:
@@ -158,10 +160,13 @@ jobs:
             dist
       - uses: actions/upload-artifact@v4
         with:
-          name: rustsync-${{ matrix.asset }}
-          path: |
-            dist/rustsync-${{ needs.metadata.outputs.version }}-linux-${{ matrix.asset }}
-            dist/rustsync_${{ needs.metadata.outputs.version }}_${{ matrix.deb_arch }}.deb
+          name: rustsync-${{ needs.metadata.outputs.version }}-linux-${{ matrix.asset }}
+          path: dist/rustsync-${{ needs.metadata.outputs.version }}-linux-${{ matrix.asset }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustsync_${{ needs.metadata.outputs.version }}_${{ matrix.deb_arch }}.deb
+          path: dist/rustsync_${{ needs.metadata.outputs.version }}_${{ matrix.deb_arch }}.deb
           if-no-files-found: error
 
   publish:
@@ -186,6 +191,15 @@ jobs:
             sha256sum "${files[@]}" > SHA256SUMS
             sha256sum -c SHA256SUMS
           )
+          {
+            echo "### Release artifacts"
+            echo "| File | Size |"
+            echo "| --- | ---: |"
+            while IFS= read -r file; do
+              size="$(stat -c '%s' "$file")"
+              printf '| `%s` | %s bytes |\n' "${file#dist/}" "$size"
+            done < <(find dist -maxdepth 1 -type f | sort)
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets
