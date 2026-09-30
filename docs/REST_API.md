@@ -58,6 +58,11 @@ GET    /api/v1/folders/<id>
 PUT    /api/v1/folders/<id>
 DELETE /api/v1/folders/<id>
 POST   /api/v1/folders/<id>/scan
+POST   /api/v1/folders/<id>/sync
+GET    /api/v1/folders/<id>/sync
+PUT    /api/v1/folders/<id>/sync
+POST   /api/v1/folders/<id>/links/generate
+GET    /api/v1/sync/runs
 ```
 
 Create payload:
@@ -68,7 +73,13 @@ Create payload:
   "path": "/srv/sync/documents",
   "include": "docs/**,*.md",
   "exclude": "private/**,*.tmp",
-  "enabled": true
+  "enabled": true,
+  "sync": {
+    "access": "read-write",
+    "peers": ["192.168.1.20:22000"],
+    "auto_sync": true,
+    "sync_interval_seconds": 300
+  }
 }
 ```
 
@@ -77,6 +88,30 @@ duplicate registrations are rejected. Include/exclude syntax is the same
 comma-separated selection language used by `rustsync scan`. A folder scan
 writes the normal `.rustsync-manifest.json` manifest below its root and stores
 the scan summary in server state.
+
+Set `"sync": {"link": "<raw key or rustsync URI>"}` to import a Standard
+Folder. Supported link keys are `A`/`D` for read-write and `B`/`E` for
+read-only. A URI can carry explicit peers:
+
+```text
+rustsync://A...?access=read-write&peer=192.168.1.20%3A22000&device=desktop
+```
+
+Generated share keys and links are returned only by creation or
+`links/generate`; normal folder listings expose the key type and share ID but
+never the secret key. The generate endpoint returns a `B` compatibility link
+derived from an existing `A`/`D` folder key when read-only access is selected;
+the folder remains read-write and keeps its original key.
+
+`POST .../sync` starts a manual run and returns `202` with a run record. The
+other two `sync` endpoints return run status/history and update automatic
+synchronization settings without replacing the stored key. Include/exclude
+rules are applied to every automatic and manual run as selective
+synchronization.
+
+Resilio Sync Advanced Folders and ACLs are outside this compatibility scope.
+The repository does not implement the encrypted Standard Folder key and data
+format, so encrypted links are not accepted.
 
 ## Direct Core Operations
 

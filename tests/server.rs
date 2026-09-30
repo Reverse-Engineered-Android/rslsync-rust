@@ -53,10 +53,20 @@ fn serves_authenticated_folder_management() {
                 "include": "*.md",
                 "exclude": "private/**",
                 "enabled": true,
+                "sync": {
+                    "access": "read-write",
+                    "peers": ["127.0.0.1:22000"],
+                    "auto_sync": false,
+                    "sync_interval_seconds": 60
+                }
             })),
         )
         .unwrap();
     assert_eq!(created["name"], json!("Documents"));
+    assert_eq!(created["folder"]["name"], json!("Documents"));
+    assert!(created["link"].as_str().unwrap().starts_with("rustsync://"));
+    assert!(created["folder"]["sync"]["share_id"].is_string());
+    assert!(created["folder"]["sync"].get("key").is_none());
 
     let scanned: Value = authenticated
         .call(
@@ -67,4 +77,34 @@ fn serves_authenticated_folder_management() {
         .unwrap();
     assert_eq!(scanned["scan"]["file_count"], json!(1));
     assert!(folder.join(".rustsync-manifest.json").is_file());
+
+    let read_only: Value = authenticated
+        .call(
+            "POST",
+            &format!(
+                "/api/v1/folders/{}/links/generate",
+                created["id"].as_str().unwrap()
+            ),
+            Some(&json!({"access": "read-only"})),
+        )
+        .unwrap();
+    assert_eq!(read_only["folder"]["sync"]["access"], json!("read-write"));
+    assert_eq!(
+        read_only["folder"]["sync"]["share_id"],
+        created["folder"]["sync"]["share_id"]
+    );
+    assert!(read_only["link"]
+        .as_str()
+        .unwrap()
+        .contains("access=read-only"));
+
+    let status: Value = authenticated
+        .call(
+            "GET",
+            &format!("/api/v1/folders/{}/sync", created["id"].as_str().unwrap()),
+            None::<&Value>,
+        )
+        .unwrap();
+    assert_eq!(status["running"], json!(false));
+    assert!(status["runs"].as_array().unwrap().is_empty());
 }

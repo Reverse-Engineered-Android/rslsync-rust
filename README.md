@@ -173,9 +173,9 @@ reconcile on every accepted or dialed synchronization session. `serve-upstream`
 also advertises the peer on upstream LAN multicast, subnet broadcast, and
 loopback UDP port `3838`.
 
-Use a firewall and trusted network while testing experimental
-interoperability. Never commit share keys, credentials, peer secrets,
-databases, `.sync/` state, logs, or runtime paths.
+Use a firewall and trusted network while testing experimental Standard Folder
+key and synchronization interoperability. Never commit share keys, credentials,
+peer secrets, databases, `.sync/` state, logs, or runtime paths.
 
 ## Implemented Core
 

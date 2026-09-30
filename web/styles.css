@@ -29,7 +29,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -123,7 +124,8 @@ label {
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   min-width: 0;
   max-width: 100%;
@@ -145,7 +147,8 @@ textarea {
 }
 
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   border-color: var(--focus);
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
 }
@@ -281,7 +284,7 @@ button {
 .folder-form {
   padding: 18px;
   display: grid;
-  grid-template-columns: minmax(150px, 0.7fr) minmax(260px, 1.5fr) minmax(180px, 1fr) minmax(180px, 1fr);
+  grid-template-columns: repeat(4, minmax(180px, 1fr));
   gap: 14px;
   border: 1px solid var(--line);
   background: var(--surface);
@@ -291,6 +294,27 @@ button {
   grid-column: 1 / -1;
   display: flex;
   gap: 10px;
+}
+
+.sync-checkbox {
+  align-self: end;
+  min-height: 42px;
+  padding-bottom: 8px;
+}
+
+.auto-toggle {
+  margin-top: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.auto-toggle input {
+  width: 16px;
+  min-height: 16px;
 }
 
 .folder-list {
@@ -336,11 +360,23 @@ button {
 
 .row-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 7px;
 }
 
 .row-actions .icon-button {
   font-size: 16px;
+}
+
+.row-actions .labeled-action {
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid #aab5b0;
+  background: #fff;
+  color: var(--ink);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .empty-state {
@@ -460,18 +496,22 @@ button {
   }
 
   .folder-row {
-    grid-template-columns: 1fr auto;
+    grid-template-columns: minmax(0, 1fr);
     gap: 10px;
   }
 
+  .folder-name,
   .folder-path {
     grid-column: 1 / -1;
-    grid-row: 2;
+  }
+
+  .folder-meta {
+    display: block;
   }
 
   .row-actions {
-    grid-column: 2;
-    grid-row: 1;
+    grid-column: 1;
+    justify-content: flex-start;
   }
 
   .form-actions {

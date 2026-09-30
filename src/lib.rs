@@ -16,6 +16,8 @@ pub mod server;
 pub mod server_state;
 pub mod srpeh;
 pub mod state;
+pub mod sync_link;
+pub mod sync_manager;
 pub mod sync_session;
 pub mod sync_state;
 pub mod tls;

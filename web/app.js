@@ -26,6 +26,12 @@ const elements = {
   folderPath: document.querySelector("#folder-path"),
   folderInclude: document.querySelector("#folder-include"),
   folderExclude: document.querySelector("#folder-exclude"),
+  folderLinkMode: document.querySelector("#folder-link-mode"),
+  folderLinkField: document.querySelector("#folder-link-field"),
+  folderLink: document.querySelector("#folder-link"),
+  folderPeers: document.querySelector("#folder-peers"),
+  folderAutoSync: document.querySelector("#folder-auto-sync"),
+  folderSyncInterval: document.querySelector("#folder-sync-interval"),
   folderSubmitButton: document.querySelector("#folder-submit-button"),
   folderCancelButton: document.querySelector("#folder-cancel-button"),
   folderList: document.querySelector("#folder-list"),
@@ -141,16 +147,46 @@ function renderFolders() {
 
     const meta = document.createElement("div");
     meta.className = "folder-meta";
-    meta.textContent = folder.last_scan
+    const scanText = folder.last_scan
       ? `${folder.last_scan.file_count} 个文件 · ${formatBytes(folder.last_scan.total_file_size)}`
-      : folder.enabled
-        ? "尚未扫描"
-        : "已停用";
+      : folder.enabled ? "尚未扫描" : "已停用";
+    const syncText = folder.sync
+      ? `${folder.sync.access === "read-write" ? "读写" : "只读"} · ${folder.sync.peers.length} 个节点`
+      : "仅扫描";
+    const lastSyncText = folder.last_sync
+      ? ` · 上次同步${folder.last_sync.status === "success" ? "成功" : folder.last_sync.status === "error" ? "失败" : folder.last_sync.status === "partial" ? "部分成功" : "中"}`
+      : "";
+    meta.textContent = `${scanText} · ${syncText}${lastSyncText}`;
+
+    if (folder.sync) {
+      const autoLabel = document.createElement("label");
+      autoLabel.className = "auto-toggle";
+      const autoInput = document.createElement("input");
+      autoInput.type = "checkbox";
+      autoInput.checked = folder.sync.auto_sync;
+      autoInput.title = "自动同步";
+      autoInput.addEventListener("change", () => updateAutoSync(folder, autoInput.checked));
+      const autoText = document.createElement("span");
+      autoText.textContent = "自动";
+      autoLabel.append(autoInput, autoText);
+      meta.append(autoLabel);
+    }
 
     const actions = document.createElement("div");
     actions.className = "row-actions";
     actions.append(
       iconButton("↻", "扫描", () => scanFolder(folder.id)),
+      ...(folder.sync
+        ? [
+            iconButton("⇄", "立即同步", () => syncFolder(folder.id)),
+            labeledButton("读写链接", "生成读写链接", () =>
+              generateFolderLink(folder.id, "read-write"),
+            ),
+            labeledButton("只读链接", "生成只读链接", () =>
+              generateFolderLink(folder.id, "read-only"),
+            ),
+          ]
+        : []),
       iconButton(folder.enabled ? "Ⅱ" : "▶", folder.enabled ? "停用" : "启用", () =>
         toggleFolder(folder),
       ),
@@ -174,12 +210,31 @@ function iconButton(symbol, label, action) {
   return button;
 }
 
+function labeledButton(text, label, action) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "labeled-action";
+  button.textContent = text;
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.addEventListener("click", action);
+  return button;
+}
+
 function editFolder(folder) {
   elements.folderId.value = folder.id;
   elements.folderName.value = folder.name;
   elements.folderPath.value = folder.path;
   elements.folderInclude.value = folder.include || "";
   elements.folderExclude.value = folder.exclude || "";
+  elements.folderLinkMode.value = folder.sync ? "import" : "generate-rw";
+  elements.folderLinkMode.disabled = Boolean(folder.sync);
+  elements.folderLinkField.classList.add("hidden");
+  elements.folderLink.required = false;
+  elements.folderLink.value = "";
+  elements.folderPeers.value = folder.sync?.peers.join(", ") || "";
+  elements.folderAutoSync.checked = folder.sync?.auto_sync || false;
+  elements.folderSyncInterval.value = folder.sync?.sync_interval_seconds || 300;
   elements.folderSubmitButton.textContent = "保存文件夹";
   elements.folderCancelButton.classList.remove("hidden");
   elements.folderForm.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -188,6 +243,12 @@ function editFolder(folder) {
 function resetFolderForm() {
   elements.folderForm.reset();
   elements.folderId.value = "";
+  elements.folderLinkMode.disabled = false;
+  elements.folderLinkMode.value = "generate-rw";
+  elements.folderLinkField.classList.add("hidden");
+  elements.folderLink.required = false;
+  elements.folderAutoSync.checked = false;
+  elements.folderSyncInterval.value = 300;
   elements.folderSubmitButton.textContent = "添加文件夹";
   elements.folderCancelButton.classList.add("hidden");
 }
@@ -222,6 +283,70 @@ async function toggleFolder(folder) {
       body: JSON.stringify({ enabled: !folder.enabled }),
     });
     showToast(folder.enabled ? "文件夹已停用。" : "文件夹已启用。");
+    await loadFolders();
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
+async function syncFolder(id) {
+  try {
+    await api(`/api/v1/folders/${id}/sync`, { method: "POST" });
+    showToast("手动同步已启动。");
+    await pollSyncStatus(id);
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
+async function pollSyncStatus(id) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    try {
+      const result = await api(`/api/v1/folders/${id}/sync`);
+      if (!result.running) {
+        const run = result.last_sync;
+        showToast(run?.message || `同步${run?.status === "success" ? "完成" : "结束"}。`, run?.status === "error");
+        await loadFolders();
+        return;
+      }
+    } catch (error) {
+      showToast(error.message, true);
+      return;
+    }
+  }
+  await loadFolders();
+}
+
+async function updateAutoSync(folder, enabled) {
+  try {
+    await api(`/api/v1/folders/${folder.id}/sync`, {
+      method: "PUT",
+      body: JSON.stringify({
+        auto_sync: enabled,
+        sync_interval_seconds: folder.sync?.sync_interval_seconds || 300,
+        peers: folder.sync?.peers || [],
+      }),
+    });
+    showToast(enabled ? "自动同步已启用。" : "自动同步已停用。");
+    await loadFolders();
+  } catch (error) {
+    showToast(error.message, true);
+    await loadFolders();
+  }
+}
+
+async function generateFolderLink(id, access) {
+  try {
+    const result = await api(`/api/v1/folders/${id}/links/generate`, {
+      method: "POST",
+      body: JSON.stringify({ access }),
+    });
+    const link = result.folder.link;
+    await navigator.clipboard?.writeText(link);
+    elements.toolOutput.textContent = link;
+    elements.toolOutput.scrollIntoView({ behavior: "smooth", block: "center" });
+    showToast(`${access === "read-write" ? "读写" : "只读"}链接已生成并复制。`);
     await loadFolders();
   } catch (error) {
     showToast(error.message, true);
@@ -315,6 +440,25 @@ elements.folderForm.addEventListener("submit", async (event) => {
     exclude: elements.folderExclude.value,
   };
   const id = elements.folderId.value;
+  const peers = elements.folderPeers.value
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const sync = {
+    peers,
+    auto_sync: elements.folderAutoSync.checked,
+    sync_interval_seconds: Number(elements.folderSyncInterval.value),
+  };
+  if (!id) {
+    if (elements.folderLinkMode.value === "import") {
+      sync.link = elements.folderLink.value.trim();
+    } else {
+      sync.access = elements.folderLinkMode.value === "generate-ro" ? "read-only" : "read-write";
+    }
+    payload.sync = sync;
+  } else if (state.folders.some((folder) => folder.id === id && folder.sync)) {
+    payload.sync = sync;
+  }
   try {
     if (id) {
       await api(`/api/v1/folders/${id}`, {
@@ -323,17 +467,29 @@ elements.folderForm.addEventListener("submit", async (event) => {
       });
       showToast("文件夹设置已更新。");
     } else {
-      await api("/api/v1/folders", {
+      const result = await api("/api/v1/folders", {
         method: "POST",
         body: JSON.stringify({ ...payload, enabled: true }),
       });
-      showToast("文件夹已添加。");
+      if (result.folder.link) {
+        await navigator.clipboard?.writeText(result.folder.link);
+        elements.toolOutput.textContent = result.folder.link;
+        showToast("文件夹已添加，共享链接已生成并复制。");
+      } else {
+        showToast("文件夹已添加。");
+      }
     }
     resetFolderForm();
     await loadFolders();
   } catch (error) {
     showToast(error.message, true);
   }
+});
+
+elements.folderLinkMode.addEventListener("change", () => {
+  const importing = elements.folderLinkMode.value === "import";
+  elements.folderLinkField.classList.toggle("hidden", !importing);
+  elements.folderLink.required = importing;
 });
 
 elements.folderCancelButton.addEventListener("click", resetFolderForm);
