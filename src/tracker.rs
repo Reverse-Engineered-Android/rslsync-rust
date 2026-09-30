@@ -258,7 +258,7 @@ pub fn parse_tracker_http_response(response: &[u8]) -> Result<TrackerResponse> {
         if raw.len() % 6 != 0 {
             bail!("compact tracker peer list has invalid length");
         }
-        for chunk in raw.chunks_exact(6) {
+        for chunk in raw.as_chunks::<6>().0 {
             let address = SocketAddr::from((
                 <[u8; 4]>::try_from(&chunk[..4]).unwrap(),
                 u16::from_be_bytes([chunk[4], chunk[5]]),
