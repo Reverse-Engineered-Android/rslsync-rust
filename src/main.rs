@@ -1,11 +1,15 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rustsync::apply::{apply_manifest, ConflictPolicy};
+use rustsync::apply::{apply_manifest_with_policy, ApplyPolicy, ConflictPolicy};
 use rustsync::discovery::LanPing;
+use rustsync::encrypted::{decrypt_tree, encrypt_tree};
 use rustsync::peer::{pull, random_peer_id, serve_once};
-use rustsync::scan::{manifest_path, scan_root};
+use rustsync::permissions::PermissionPolicy;
+use rustsync::scan::{manifest_path, scan_root_with_selection};
 use rustsync::secret::ShareKey;
+use rustsync::selective::SyncSelection;
 use rustsync::sync_session::SyncNode;
+use rustsync::tracker::{TrackerClient, TrackerRequest, TrackerServer};
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -24,6 +28,10 @@ enum Command {
         root: PathBuf,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[arg(long)]
+        include: Option<String>,
+        #[arg(long)]
+        exclude: Option<String>,
     },
     /// Verify a manifest and atomically copy its entries from source to target.
     Apply {
@@ -33,6 +41,8 @@ enum Command {
         manifest: Option<PathBuf>,
         #[arg(long, default_value = "overwrite")]
         conflict: String,
+        #[arg(long, default_value = "preserve")]
+        permissions: String,
     },
     /// Generate an upstream-compatible B/read-only or A/read-write share key.
     GenerateKey {
@@ -79,6 +89,13 @@ enum Command {
         peer_id: Option<String>,
         #[arg(long)]
         no_discovery: bool,
+        #[arg(long)]
+        include: Option<String>,
+        #[arg(long)]
+        exclude: Option<String>,
+        /// HTTP tracker URLs used for peer discovery.
+        #[arg(long)]
+        tracker: Vec<String>,
     },
     /// Continuously connect to an upstream peer and resynchronize.
     ConnectUpstream {
@@ -90,13 +107,56 @@ enum Command {
         device_name: String,
         #[arg(long)]
         peer_id: Option<String>,
+        #[arg(long)]
+        include: Option<String>,
+        #[arg(long)]
+        exclude: Option<String>,
+        /// HTTP tracker URLs used for peer discovery.
+        #[arg(long)]
+        tracker: Vec<String>,
+    },
+    /// Encrypt a directory into a self-contained authenticated vault.
+    EncryptTree {
+        source: PathBuf,
+        destination: PathBuf,
+        #[arg(long)]
+        passphrase: String,
+    },
+    /// Decrypt an authenticated encrypted vault into a directory.
+    DecryptTree {
+        source: PathBuf,
+        destination: PathBuf,
+        #[arg(long)]
+        passphrase: String,
+    },
+    /// Announce to an HTTP tracker and print returned peers as JSON.
+    TrackerAnnounce {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        info_hash: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long)]
+        port: u16,
+    },
+    /// Serve a minimal independent HTTP tracker.
+    TrackerServe {
+        #[arg(long, default_value = "127.0.0.1:0")]
+        listen: String,
     },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Scan { root, output } => {
-            let manifest = scan_root(&root)?;
+        Command::Scan {
+            root,
+            output,
+            include,
+            exclude,
+        } => {
+            let selection = SyncSelection::from_csv(include.as_deref(), exclude.as_deref())?;
+            let manifest = scan_root_with_selection(&root, &selection)?;
             let destination = output.unwrap_or_else(|| manifest_path(&root));
             let json = serde_json::to_vec_pretty(&manifest)?;
             fs::write(&destination, json)
@@ -108,17 +168,32 @@ fn main() -> Result<()> {
             target,
             manifest,
             conflict,
+            permissions,
         } => {
-            let policy = match conflict.as_str() {
+            let conflict = match conflict.as_str() {
                 "overwrite" => ConflictPolicy::Overwrite,
                 "preserve" => ConflictPolicy::Preserve,
                 value => bail!("conflict policy must be overwrite or preserve, got {value}"),
+            };
+            let permissions = match permissions.as_str() {
+                "preserve" => PermissionPolicy::Preserve,
+                "ignore" => PermissionPolicy::Ignore,
+                "check" => PermissionPolicy::CheckOnly,
+                value => bail!("permissions must be preserve, ignore, or check, got {value}"),
             };
             let path = manifest.unwrap_or_else(|| manifest_path(&source));
             let manifest: rustsync::Manifest = serde_json::from_slice(
                 &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
             )?;
-            apply_manifest(&source, &target, &manifest, policy)?;
+            apply_manifest_with_policy(
+                &source,
+                &target,
+                &manifest,
+                ApplyPolicy {
+                    conflict,
+                    permissions,
+                },
+            )?;
             println!("{} {}", manifest.root_hash, target.display());
         }
         Command::GenerateKey { read_write } => {
@@ -179,6 +254,9 @@ fn main() -> Result<()> {
             device_name,
             peer_id,
             no_discovery,
+            include,
+            exclude,
+            tracker,
         } => {
             let peer_id = peer_id
                 .map(|value| parse_fixed_20(&value, "peer ID"))
@@ -186,7 +264,12 @@ fn main() -> Result<()> {
                 .unwrap_or_else(rustsync::sync_session::random_peer_id);
             let sync =
                 SyncNode::new_with_peer_id(root, ShareKey::parse(&key)?, device_name, peer_id)?;
-            sync.serve_with_discovery(&listen, !no_discovery)?;
+            sync.with_selection(SyncSelection::from_csv(
+                include.as_deref(),
+                exclude.as_deref(),
+            )?)
+            .with_trackers(tracker)
+            .serve_with_discovery(&listen, !no_discovery)?;
         }
         Command::ConnectUpstream {
             root,
@@ -194,6 +277,9 @@ fn main() -> Result<()> {
             key,
             device_name,
             peer_id,
+            include,
+            exclude,
+            tracker,
         } => {
             let peer_id = peer_id
                 .map(|value| parse_fixed_20(&value, "peer ID"))
@@ -201,7 +287,67 @@ fn main() -> Result<()> {
                 .unwrap_or_else(rustsync::sync_session::random_peer_id);
             let sync =
                 SyncNode::new_with_peer_id(root, ShareKey::parse(&key)?, device_name, peer_id)?;
-            sync.connect(&address)?;
+            sync.with_selection(SyncSelection::from_csv(
+                include.as_deref(),
+                exclude.as_deref(),
+            )?)
+            .with_trackers(tracker)
+            .connect(&address)?;
+        }
+        Command::EncryptTree {
+            source,
+            destination,
+            passphrase,
+        } => {
+            let manifest = encrypt_tree(&source, &destination, passphrase.as_bytes())?;
+            println!("{} {}", manifest.files.len(), destination.display());
+        }
+        Command::DecryptTree {
+            source,
+            destination,
+            passphrase,
+        } => {
+            let manifest = decrypt_tree(&source, &destination, passphrase.as_bytes())?;
+            println!("{} {}", manifest.files.len(), destination.display());
+        }
+        Command::TrackerAnnounce {
+            url,
+            info_hash,
+            peer_id,
+            port,
+        } => {
+            let response = TrackerClient::new(url).announce(&TrackerRequest {
+                info_hash: parse_fixed_20(&info_hash, "info hash")?,
+                peer_id: parse_fixed_20(&peer_id, "peer ID")?,
+                port,
+                uploaded: 0,
+                downloaded: 0,
+                left: 0,
+                event: Some("started".into()),
+            })?;
+            let peers = response
+                .peers
+                .iter()
+                .map(|peer| {
+                    serde_json::json!({
+                        "address": peer.address.to_string(),
+                        "peer_id": peer.peer_id.map(hex::encode),
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "interval": response.interval,
+                    "warning": response.warning,
+                    "peers": peers,
+                })
+            );
+        }
+        Command::TrackerServe { listen } => {
+            let server = TrackerServer::bind(&listen)?;
+            eprintln!("tracker listening on {}", server.local_addr()?);
+            server.serve_forever()?;
         }
     }
     Ok(())

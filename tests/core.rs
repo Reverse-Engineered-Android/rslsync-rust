@@ -1,6 +1,9 @@
-use rustsync::apply::{apply_manifest, ConflictPolicy};
-use rustsync::scan::scan_root;
+use rustsync::apply::{apply_manifest, apply_manifest_with_policy, ApplyPolicy, ConflictPolicy};
+use rustsync::permissions::PermissionPolicy;
+use rustsync::scan::{scan_root, scan_root_with_selection};
+use rustsync::selective::SyncSelection;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
 #[test]
@@ -52,4 +55,78 @@ fn preserve_policy_keeps_existing_target() {
     )
     .unwrap();
     assert_eq!(fs::read(target.path().join("file")).unwrap(), b"local");
+}
+
+#[test]
+fn selection_prunes_excluded_directories() {
+    let source = tempdir().unwrap();
+    fs::create_dir_all(source.path().join("private/nested")).unwrap();
+    fs::write(source.path().join("private/nested/key.txt"), b"secret").unwrap();
+    fs::write(source.path().join("public.txt"), b"public").unwrap();
+    let selection = SyncSelection::new(Vec::<String>::new(), ["private/**"]).unwrap();
+
+    let manifest = scan_root_with_selection(source.path(), &selection).unwrap();
+    assert_eq!(
+        manifest
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["public.txt"]
+    );
+}
+
+#[test]
+fn permission_policies_control_only_metadata_application() {
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    fs::write(source.path().join("file"), b"new").unwrap();
+    fs::write(target.path().join("file"), b"old").unwrap();
+    fs::set_permissions(
+        source.path().join("file"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(
+        target.path().join("file"),
+        fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let manifest = scan_root(source.path()).unwrap();
+
+    apply_manifest_with_policy(
+        source.path(),
+        target.path(),
+        &manifest,
+        ApplyPolicy {
+            conflict: ConflictPolicy::Overwrite,
+            permissions: PermissionPolicy::Ignore,
+        },
+    )
+    .unwrap();
+    assert_eq!(fs::read(target.path().join("file")).unwrap(), b"new");
+    assert_eq!(
+        fs::metadata(target.path().join("file"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o666
+    );
+
+    fs::set_permissions(
+        target.path().join("file"),
+        fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    assert!(apply_manifest_with_policy(
+        source.path(),
+        target.path(),
+        &manifest,
+        ApplyPolicy {
+            conflict: ConflictPolicy::Overwrite,
+            permissions: PermissionPolicy::CheckOnly,
+        },
+    )
+    .is_err());
 }

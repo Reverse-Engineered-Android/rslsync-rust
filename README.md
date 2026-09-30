@@ -8,9 +8,10 @@ response modes. The verified core is bidirectional in both directions.
 
 The compatibility boundary is intentionally explicit. Regular files, nested
 paths, directories, tombstones, recreation, metadata changes, and deterministic
-conflict preservation are implemented. Tracker relays, selective sync,
-encrypted folders, permissions/ACL identity, and every proprietary UI feature
-are outside this project. See [`COMPATIBILITY.md`](COMPATIBILITY.md).
+conflict preservation are implemented. The additional encrypted-folder,
+selective-sync, POSIX-permission, and tracker layers are independent Rust
+designs implemented in this repository; they do not depend on proprietary
+client code or configuration. See [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
 ## Linux Quick Start
 
@@ -26,6 +27,30 @@ Scan and atomically apply a tree with the standalone core:
 ```bash
 cargo run -- scan /path/to/folder
 cargo run -- apply /path/to/source /path/to/target
+```
+
+Selective scan rules use comma-separated patterns; `**` crosses directories,
+`*` stays within one path component, and exclusions win over inclusions:
+
+```bash
+cargo run -- scan /path/to/folder --include 'docs/**,*.md' --exclude 'private/**,*.tmp'
+```
+
+Pack a directory into an authenticated encrypted vault and restore it with a
+passphrase. The vault stores encrypted metadata and opaque object names:
+
+```bash
+cargo run -- encrypt-tree /path/to/plain /path/to/vault --passphrase 'change-me'
+cargo run -- decrypt-tree /path/to/vault /path/to/restored --passphrase 'change-me'
+```
+
+The tracker implementation uses an independent HTTP announce contract and
+compact peer lists:
+
+```bash
+cargo run -- tracker-serve --listen 127.0.0.1:8000
+cargo run -- tracker-announce --url http://127.0.0.1:8000/announce \
+  --info-hash <40-hex> --peer-id <40-hex> --port 57301
 ```
 
 Inspect a share key without printing its secret body:
@@ -92,6 +117,15 @@ databases, `.sync/` state, logs, or runtime paths.
   `.Conflict`/`.Conflict2` siblings, and conflict archives for delete races.
 - Directory metadata and nested tree nodes using metadata plus ordered child
   digests; type changes preserve the losing filesystem value.
+- Selective sync patterns with include/exclude precedence and descendant-safe
+  directory traversal.
+- POSIX mode, uid, and gid metadata capture/check/apply policies.
+- Independent AES-256-GCM encrypted vaults with PBKDF2-HMAC-SHA256 key
+  derivation, authenticated paths, and opaque object names.
+- Independent HTTP tracker announce/client/server with compact peer lists.
+- Upstream merge-controller compatibility fields and empty-ACL exchange:
+  `acl_hash`, `active_size`, `exclusive_merge_connection`, ACL node/entry
+  pagination, and `get_files_next`.
 
 ## Reconciliation Summary
 
@@ -116,11 +150,16 @@ machines are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 - `src/sync_session.rs`: peer sessions, merge, reconciliation, and transfers.
 - `src/sync_state.rs`: synchronized baselines, fingerprints, and tombstones.
 - `src/scan.rs` / `src/apply.rs`: standalone tree scan and atomic apply.
+- `src/selective.rs`: portable include/exclude path matching.
+- `src/permissions.rs`: POSIX permission metadata and policy enforcement.
+- `src/encrypted.rs`: authenticated encrypted-folder vault format.
+- `src/tracker.rs`: independent HTTP tracker protocol and registry.
+- `src/acl.rs`: signed ACL entry model and deterministic ACL hashes.
 - `src/secret.rs`: non-secret share-key and signing-key derivation.
 
 ## Testing
 
-`cargo test --all-targets` runs 64 unit tests and 2 integration tests. The suite
+`cargo test --all-targets` runs 80 unit tests and 4 integration tests. The suite
 covers SRPEH proof/cipher continuity, tunnel frames, metadata signatures,
 content hashes, node discovery, atomic apply, reconciliation decisions,
 tombstones, recreation, conflict siblings, type changes, and nested directory

@@ -330,9 +330,19 @@ compression makes the frame smaller.
 | `get_have_pieces` | requester | none | answer local piece availability |
 | `have_pieces` | responder | `bitlist`, `hash`, `prev_hash` | accept availability data |
 | `state_notify` | both | `tree_hash`, `have_pieces_hash`, `m` | immediately request `get_root`; reconcile in the current session |
+| `get_acl_nodes` / `acl_nodes` | merge peers | `acl_hash`, `nodes` | exchange ACL tree nodes before file nodes |
+| `get_acl_entries` / `acl_entries` | merge peers | `acl_hash`, `offset`, `entries` | page signed ACL entries |
+| `acl_entries_accepted` | merge peers | `acl_hash` | finish ACL merge and continue root/node exchange |
+| `not_master` | merge peer | `m` | cancel the current merge attempt and retry as requester |
 
 `id.pk` is the A/D metadata public key. `files.main` is signed with
 `Ed25519_sign(SHA1(bencode(main)))`.
+
+The upstream merge-controller also carries `acl_hash`, `active_size`,
+`exclusive_merge_connection`, and node `offset` fields. `rustsync` emits and
+recognizes these fields for forward compatibility. An empty ACL is represented
+by the deterministic hash of an empty signed-entry list; ACL entry bodies use
+the upstream `type`, `t`, `s`, `o`, `ot`, `issuer`, and `sig` vocabulary.
 
 ## 9. Metadata, Hashes, and Tree Nodes
 

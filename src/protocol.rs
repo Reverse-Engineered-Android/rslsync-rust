@@ -1180,6 +1180,49 @@ pub fn identity_from_base32(value: &str) -> Result<PeerIdentity> {
     })
 }
 
+/// Build the upstream merge-controller ACL message family. The empty-list
+/// forms are valid for a folder without ACL entries and keep older peers on
+/// the normal tree-merge path.
+pub fn get_acl_nodes_message(acl_hash: [u8; 20]) -> Value {
+    Value::dict([
+        (b"acl_hash".to_vec(), Value::bytes(acl_hash)),
+        (b"m".to_vec(), Value::bytes(b"get_acl_nodes")),
+    ])
+}
+
+pub fn acl_nodes_message(acl_hash: [u8; 20], nodes: Vec<Value>) -> Value {
+    Value::dict([
+        (b"acl_hash".to_vec(), Value::bytes(acl_hash)),
+        (b"m".to_vec(), Value::bytes(b"acl_nodes")),
+        (b"nodes".to_vec(), Value::List(nodes)),
+    ])
+}
+
+pub fn get_acl_entries_message(acl_hash: [u8; 20], offset: i64) -> Value {
+    Value::dict([
+        (b"acl_hash".to_vec(), Value::bytes(acl_hash)),
+        (b"entries".to_vec(), Value::List(Vec::new())),
+        (b"m".to_vec(), Value::bytes(b"get_acl_entries")),
+        (b"offset".to_vec(), Value::Int(offset)),
+    ])
+}
+
+pub fn acl_entries_message(acl_hash: [u8; 20], entries: Vec<Value>, offset: i64) -> Value {
+    Value::dict([
+        (b"acl_hash".to_vec(), Value::bytes(acl_hash)),
+        (b"entries".to_vec(), Value::List(entries)),
+        (b"m".to_vec(), Value::bytes(b"acl_entries")),
+        (b"offset".to_vec(), Value::Int(offset)),
+    ])
+}
+
+pub fn acl_entries_accepted_message(acl_hash: [u8; 20]) -> Value {
+    Value::dict([
+        (b"acl_hash".to_vec(), Value::bytes(acl_hash)),
+        (b"m".to_vec(), Value::bytes(b"acl_entries_accepted")),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1586,6 +1629,36 @@ mod tests {
         assert_eq!(
             message.get(b"pk").unwrap().as_bytes().unwrap(),
             key.ed25519_public_key().unwrap().as_slice()
+        );
+    }
+
+    #[test]
+    fn acl_merge_messages_keep_upstream_wire_fields() {
+        let hash = [0x2a; 20];
+        let nodes = get_acl_nodes_message(hash);
+        assert_eq!(
+            nodes.get(b"m").unwrap().as_bytes().unwrap(),
+            b"get_acl_nodes"
+        );
+        assert_eq!(nodes.get(b"acl_hash").unwrap().as_bytes().unwrap(), hash);
+
+        let entries = acl_entries_message(hash, Vec::new(), 17);
+        assert_eq!(
+            entries.get(b"m").unwrap().as_bytes().unwrap(),
+            b"acl_entries"
+        );
+        assert_eq!(entries.get(b"offset").unwrap().as_int().unwrap(), 17);
+        assert!(entries
+            .get(b"entries")
+            .unwrap()
+            .as_list()
+            .unwrap()
+            .is_empty());
+
+        let accepted = acl_entries_accepted_message(hash);
+        assert_eq!(
+            accepted.get(b"m").unwrap().as_bytes().unwrap(),
+            b"acl_entries_accepted"
         );
     }
 }

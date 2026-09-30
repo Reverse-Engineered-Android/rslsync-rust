@@ -1,4 +1,5 @@
 use crate::model::{Entry, EntryKind, Manifest, PIECE_SIZE};
+use crate::permissions::{apply_permissions, read_permissions, PermissionPolicy, PermissionRecord};
 use anyhow::{bail, Context, Result};
 use filetime::FileTime;
 use sha1::{Digest, Sha1};
@@ -14,21 +15,86 @@ pub enum ConflictPolicy {
     Overwrite,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplyPolicy {
+    pub conflict: ConflictPolicy,
+    pub permissions: PermissionPolicy,
+}
+
 pub fn apply_manifest(
     source_root: &Path,
     target_root: &Path,
     manifest: &Manifest,
     conflict: ConflictPolicy,
 ) -> Result<()> {
+    apply_manifest_with_policy(
+        source_root,
+        target_root,
+        manifest,
+        ApplyPolicy {
+            conflict,
+            permissions: PermissionPolicy::Preserve,
+        },
+    )
+}
+
+pub fn apply_manifest_with_policy(
+    source_root: &Path,
+    target_root: &Path,
+    manifest: &Manifest,
+    policy: ApplyPolicy,
+) -> Result<()> {
     manifest.validate()?;
     fs::create_dir_all(target_root).with_context(|| format!("create {}", target_root.display()))?;
     for entry in &manifest.entries {
         let source = source_root.join(&entry.path);
         let target = target_root.join(&entry.path);
+        if policy.permissions == PermissionPolicy::CheckOnly {
+            if !target.exists() {
+                bail!("permission check target is missing: {}", target.display());
+            }
+            let actual = read_permissions(&target)?;
+            apply_permissions(
+                &target,
+                PermissionRecord {
+                    mode: entry.mode,
+                    uid: entry.uid.unwrap_or(actual.uid),
+                    gid: entry.gid.unwrap_or(actual.gid),
+                },
+                policy.permissions,
+            )?;
+            continue;
+        }
+        let previous_permissions = target
+            .exists()
+            .then(|| read_permissions(&target))
+            .transpose()?;
+        if entry.kind == EntryKind::File
+            && target.exists()
+            && policy.conflict == ConflictPolicy::Preserve
+        {
+            continue;
+        }
         match entry.kind {
             EntryKind::Directory => fs::create_dir_all(&target)
                 .with_context(|| format!("create directory {}", target.display()))?,
-            EntryKind::File => apply_file(source, target, entry, conflict)?,
+            EntryKind::File => apply_file(source, target.clone(), entry, policy.conflict)?,
+        }
+        if policy.permissions == PermissionPolicy::Ignore {
+            if let Some(previous) = previous_permissions {
+                apply_permissions(&target, previous, PermissionPolicy::Preserve)?;
+            }
+        } else {
+            let actual = read_permissions(&target)?;
+            apply_permissions(
+                &target,
+                PermissionRecord {
+                    mode: entry.mode,
+                    uid: entry.uid.unwrap_or(actual.uid),
+                    gid: entry.gid.unwrap_or(actual.gid),
+                },
+                policy.permissions,
+            )?;
         }
     }
     Ok(())
@@ -51,7 +117,7 @@ fn apply_file(
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .mode(entry.mode)
+        .mode(0o666)
         .open(&temporary)
         .with_context(|| format!("create {}", temporary.display()))?;
     let mut file_hash = Sha256::new();
@@ -89,7 +155,6 @@ fn apply_file(
         let _ = fs::remove_file(&temporary);
         bail!("source content hash mismatch for {}", entry.path);
     }
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(entry.mode))?;
     filetime::set_file_mtime(&temporary, FileTime::from_unix_time(entry.mtime_seconds, 0))?;
     fs::rename(&temporary, &target).with_context(|| format!("commit {}", target.display()))?;
     if let Some(parent) = target.parent() {

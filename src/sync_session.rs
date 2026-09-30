@@ -1,18 +1,23 @@
+use crate::acl::{empty_hash, parse_entries, AclState};
 use crate::bencode::{decode, decode_prefix_wire, encode, Value};
 use crate::discovery::spawn_advertiser;
 use crate::protocol::{
-    build_file_tree, decode_direct_torrent, expected_torrent_info_size, parse_content, parse_file,
-    parse_torrent_info, read_bencode_frame, read_tunnel_frame, read_wire_payload_bytes,
-    write_bencode_frame, write_bencode_frame_uncompressed, write_tunnel_frame, EntryState,
-    EntryType, FileMetadata, FileTree, PeerIdentity, TorrentMetadata, WirePayload,
-    DIRECT_TORRENT_MAGIC_V2, DIRECT_TORRENT_MAGIC_V3, PIECE_LENGTH, TUNNEL_EOF_AT_FRAME_BOUNDARY,
-    TUNNEL_PACKET_ACK, TUNNEL_PACKET_CLOSE, TUNNEL_PACKET_DATA, TUNNEL_PACKET_DATA_COMPRESSED,
-    TUNNEL_PACKET_OPEN, TUNNEL_PACKET_PING,
+    acl_entries_accepted_message, acl_entries_message, acl_nodes_message, build_file_tree,
+    decode_direct_torrent, expected_torrent_info_size, get_acl_entries_message,
+    get_acl_nodes_message, parse_content, parse_file, parse_torrent_info, read_bencode_frame,
+    read_tunnel_frame, read_wire_payload_bytes, write_bencode_frame,
+    write_bencode_frame_uncompressed, write_tunnel_frame, EntryState, EntryType, FileMetadata,
+    FileTree, PeerIdentity, TorrentMetadata, WirePayload, DIRECT_TORRENT_MAGIC_V2,
+    DIRECT_TORRENT_MAGIC_V3, PIECE_LENGTH, TUNNEL_EOF_AT_FRAME_BOUNDARY, TUNNEL_PACKET_ACK,
+    TUNNEL_PACKET_CLOSE, TUNNEL_PACKET_DATA, TUNNEL_PACKET_DATA_COMPRESSED, TUNNEL_PACKET_OPEN,
+    TUNNEL_PACKET_PING,
 };
 use crate::secret::ShareKey;
+use crate::selective::SyncSelection;
 use crate::srpeh;
 use crate::sync_state::{local_fingerprint, StateRecord, SyncStateStore};
 use crate::tls::{accept_psk, connect_psk};
+use crate::tracker::{TrackerClient, TrackerPeer, TrackerRequest};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use sha1::{Digest, Sha1};
@@ -21,6 +26,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -245,6 +251,10 @@ pub struct SyncNode {
     identity: PeerIdentity,
     metadata_public_key: [u8; 32],
     signing_key: SigningKey,
+    selection: SyncSelection,
+    trackers: Vec<String>,
+    acl_hash: [u8; 20],
+    acl: AclState,
 }
 
 impl SyncNode {
@@ -277,7 +287,64 @@ impl SyncNode {
             identity,
             metadata_public_key,
             signing_key,
+            selection: SyncSelection::all(),
+            trackers: Vec::new(),
+            acl_hash: empty_hash(),
+            acl: AclState::default(),
         })
+    }
+
+    pub fn with_selection(mut self, selection: SyncSelection) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    pub fn selection(&self) -> &SyncSelection {
+        &self.selection
+    }
+
+    pub fn with_trackers(mut self, trackers: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.trackers = trackers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_acl_state(mut self, acl: AclState) -> Self {
+        self.acl_hash = acl.hash();
+        self.acl = acl;
+        self
+    }
+
+    pub fn acl_state(&self) -> &AclState {
+        &self.acl
+    }
+
+    pub fn announce_to_trackers(&self, port: u16, event: Option<&str>) -> Result<Vec<TrackerPeer>> {
+        let info_hash: [u8; 20] = Sha1::digest(self.identity.share_id).into();
+        let mut peers = Vec::new();
+        let mut failures = Vec::new();
+        for endpoint in &self.trackers {
+            match TrackerClient::new(endpoint).announce(&TrackerRequest {
+                info_hash,
+                peer_id: self.identity.peer_id,
+                port,
+                uploaded: 0,
+                downloaded: 0,
+                left: 0,
+                event: event.map(str::to_owned),
+            }) {
+                Ok(response) => peers.extend(
+                    response
+                        .peers
+                        .into_iter()
+                        .filter(|peer| peer.peer_id != Some(self.identity.peer_id)),
+                ),
+                Err(error) => failures.push(format!("{endpoint}: {error:#}")),
+            }
+        }
+        if peers.is_empty() && !failures.is_empty() {
+            bail!("all trackers failed: {}", failures.join("; "));
+        }
+        Ok(peers)
     }
 
     pub fn serve(&self, listen: &str) -> Result<()> {
@@ -298,6 +365,40 @@ impl SyncNode {
                 )
             })
             .transpose()?;
+        if !self.trackers.is_empty() {
+            let sync = self.clone();
+            let port = address.port();
+            let seen = Arc::new(Mutex::new(HashSet::new()));
+            thread::spawn(move || {
+                let mut event = Some("started");
+                loop {
+                    match sync.announce_to_trackers(port, event) {
+                        Ok(peers) => {
+                            for peer in peers {
+                                let identity = peer.peer_id.unwrap_or_else(|| {
+                                    Sha1::digest(format!("tracker-peer:{}", peer.address)).into()
+                                });
+                                if !seen.lock().unwrap().insert(identity) {
+                                    continue;
+                                }
+                                let candidate = sync.clone();
+                                let address = peer.address;
+                                thread::spawn(move || {
+                                    if let Err(error) =
+                                        candidate.connect_any_once(&address.to_string())
+                                    {
+                                        eprintln!("tracker peer {address} disconnected: {error:#}");
+                                    }
+                                });
+                            }
+                        }
+                        Err(error) => eprintln!("tracker announce failed: {error:#}"),
+                    }
+                    event = None;
+                    thread::sleep(Duration::from_secs(60));
+                }
+            });
+        }
         loop {
             let (stream, peer) = listener.accept().context("accept upstream peer")?;
             let sync = self.clone();
@@ -367,11 +468,7 @@ impl SyncNode {
     pub fn connect(&self, address: &str) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match self.connect_srpeh_once(address).or_else(|srpeh_error| {
-                self.connect_once(address).map_err(|tls_error| {
-                    anyhow::anyhow!("SRPEH: {srpeh_error:#}; TLS-PSK: {tls_error:#}")
-                })
-            }) {
+            match self.connect_any_once(address) {
                 Ok(()) => backoff = Duration::from_secs(1),
                 Err(error) => {
                     eprintln!("upstream connection failed: {error:#}");
@@ -382,6 +479,14 @@ impl SyncNode {
             }
             thread::sleep(Duration::from_secs(1));
         }
+    }
+
+    pub fn connect_any_once(&self, address: &str) -> Result<()> {
+        self.connect_srpeh_once(address).or_else(|srpeh_error| {
+            self.connect_once(address).map_err(|tls_error| {
+                anyhow::anyhow!("SRPEH: {srpeh_error:#}; TLS-PSK: {tls_error:#}")
+            })
+        })
     }
 
     pub fn connect_once(&self, address: &str) -> Result<()> {
@@ -418,7 +523,11 @@ impl SyncNode {
         root_hash: [u8; 20],
         files: &[LocalFile],
     ) -> Result<()> {
-        write_peer_message(mux, connection_id, &state_notify_message(root_hash, files))
+        write_peer_message(
+            mux,
+            connection_id,
+            &state_notify_message(root_hash, files, self.acl_hash),
+        )
     }
 
     pub fn run_connection<S: Read + Write>(&self, stream: &mut S, initiator: bool) -> Result<()> {
@@ -440,6 +549,7 @@ impl SyncNode {
         let mut sent_file_manifest = false;
         let mut received_files = false;
         let mut merge_in_flight: Option<u32> = None;
+        let mut acl_merge_pending = false;
         let mut merge_request_at = Some(
             Instant::now()
                 + if initiator {
@@ -484,7 +594,13 @@ impl SyncNode {
                 sent_file_manifest = false;
                 requested_get_files.clear();
                 reconciled_versions.clear();
-                send_get_root(&mut mux, merge_connection, root_hash)?;
+                send_get_root(
+                    &mut mux,
+                    merge_connection,
+                    root_hash,
+                    self.acl_hash,
+                    active_size(&local_files),
+                )?;
                 sent_get_root = true;
                 merge_in_flight = Some(merge_connection);
                 merge_root_deadline = Some(Instant::now() + MERGE_ROOT_RETRY);
@@ -755,7 +871,12 @@ impl SyncNode {
                                 write_peer_message(
                                     &mut mux,
                                     packet.connection_id,
-                                    &root_message(root_hash, remote_time),
+                                    &root_message(
+                                        root_hash,
+                                        remote_time,
+                                        self.acl_hash,
+                                        active_size(&local_files),
+                                    ),
                                 )?;
                             }
                             b"root" => {
@@ -771,7 +892,20 @@ impl SyncNode {
                                     .and_then(|value| value.as_bytes().ok())
                                     .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
                                     .unwrap_or(root_hash);
-                                if remote_root != root_hash && !sent_get_nodes {
+                                let remote_acl_hash = message
+                                    .get(b"acl_hash")
+                                    .ok()
+                                    .and_then(|value| value.as_bytes().ok())
+                                    .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
+                                    .unwrap_or_else(empty_hash);
+                                if remote_acl_hash != self.acl_hash && !acl_merge_pending {
+                                    write_peer_message(
+                                        &mut mux,
+                                        packet.connection_id,
+                                        &get_acl_nodes_message(self.acl_hash),
+                                    )?;
+                                    acl_merge_pending = true;
+                                } else if remote_root != root_hash && !sent_get_nodes {
                                     sent_file_manifest = false;
                                     requested_get_files.clear();
                                     reconciled_versions.clear();
@@ -802,8 +936,69 @@ impl SyncNode {
                                     write_peer_message(
                                         &mut mux,
                                         packet.connection_id,
-                                        &nodes_message_many(response_nodes),
+                                        &nodes_message_many(
+                                            response_nodes,
+                                            message
+                                                .get(b"offset")
+                                                .ok()
+                                                .and_then(|value| value.as_int().ok())
+                                                .unwrap_or(0),
+                                        ),
                                     )?;
+                                }
+                            }
+                            b"get_acl_nodes" => {
+                                write_peer_message(
+                                    &mut mux,
+                                    packet.connection_id,
+                                    &acl_nodes_message(self.acl_hash, Vec::new()),
+                                )?;
+                            }
+                            b"acl_nodes" => {
+                                write_peer_message(
+                                    &mut mux,
+                                    packet.connection_id,
+                                    &get_acl_entries_message(self.acl_hash, 0),
+                                )?;
+                            }
+                            b"get_acl_entries" => {
+                                let offset = message
+                                    .get(b"offset")
+                                    .ok()
+                                    .and_then(|value| value.as_int().ok())
+                                    .unwrap_or(0);
+                                let entries = self
+                                    .acl
+                                    .wire_entries()
+                                    .into_iter()
+                                    .skip(offset.max(0) as usize)
+                                    .take(256)
+                                    .collect::<Vec<_>>();
+                                write_peer_message(
+                                    &mut mux,
+                                    packet.connection_id,
+                                    &acl_entries_message(self.acl_hash, entries, offset),
+                                )?;
+                            }
+                            b"acl_entries" => {
+                                parse_entries(message.get(b"entries")?)?;
+                                write_peer_message(
+                                    &mut mux,
+                                    packet.connection_id,
+                                    &acl_entries_accepted_message(self.acl_hash),
+                                )?;
+                            }
+                            b"acl_entries_accepted" => {
+                                if acl_merge_pending {
+                                    acl_merge_pending = false;
+                                    if !sent_get_nodes {
+                                        send_get_nodes(
+                                            &mut mux,
+                                            packet.connection_id,
+                                            &BTreeSet::new(),
+                                        )?;
+                                        sent_get_nodes = true;
+                                    }
                                 }
                             }
                             b"nodes" => {
@@ -858,7 +1053,7 @@ impl SyncNode {
                                     requested_get_files = desired_paths;
                                 }
                             }
-                            b"get_files" => {
+                            b"get_files" | b"get_files_next" => {
                                 let paths = requested_paths(&message)?;
                                 trace_sync(
                                     "get_files",
@@ -881,8 +1076,10 @@ impl SyncNode {
                                 let mut refreshed_remote_files = HashMap::new();
                                 for value in list {
                                     let metadata = parse_file(value, &self.metadata_public_key)?;
-                                    refreshed_remote_files
-                                        .insert(metadata.wire_path_string(), metadata);
+                                    let path = metadata.wire_path_string();
+                                    if self.selection.allows_path(&path) {
+                                        refreshed_remote_files.insert(path, metadata);
+                                    }
                                 }
                                 remote_files = refreshed_remote_files;
                                 for (path, metadata) in &remote_files {
@@ -1087,7 +1284,11 @@ impl SyncNode {
                             }
                             b"state_notify" => {
                                 merge_connections.insert(packet.connection_id);
-                                if state_notify_requires_reconcile(&message, root_hash)? {
+                                if state_notify_requires_reconcile(
+                                    &message,
+                                    root_hash,
+                                    self.acl_hash,
+                                )? {
                                     if merge_in_flight.is_some()
                                         || sent_get_root
                                         || sent_get_nodes
@@ -1124,6 +1325,17 @@ impl SyncNode {
                                         Some(Instant::now() + Duration::from_secs(2));
                                 }
                                 mux.send_close(packet.connection_id)?;
+                            }
+                            b"not_master" => {
+                                trace_sync("not_master", &format!("conn={}", packet.connection_id));
+                                merge_in_flight = None;
+                                sent_get_root = false;
+                                sent_get_nodes = false;
+                                sent_file_manifest = false;
+                                requested_get_files.clear();
+                                reconciled_versions.clear();
+                                merge_cooldown_until = None;
+                                merge_request_at = Some(Instant::now() + MERGE_NEGOTIATION_DELAY);
                             }
                             other => {
                                 eprintln!(
@@ -1606,7 +1818,7 @@ impl SyncNode {
 
     fn scan_files(&self, sync_state: &mut SyncStateStore) -> Result<Vec<LocalFile>> {
         let mut paths = Vec::new();
-        collect_files(&self.root, &self.root, &mut paths)?;
+        collect_files(&self.root, &self.root, &self.selection, &mut paths)?;
         paths.sort();
         let mut files = Vec::new();
         let mut present = BTreeSet::new();
@@ -1657,7 +1869,9 @@ impl SyncNode {
 
         let missing: Vec<(String, StateRecord)> = sync_state
             .entries()
-            .filter(|(path, record)| !present.contains(*path) && record.state == 1)
+            .filter(|(path, record)| {
+                self.selection.allows_path(path) && !present.contains(*path) && record.state == 1
+            })
             .map(|(path, record)| ((*path).clone(), record.clone()))
             .collect();
         for (path, previous) in missing {
@@ -1679,7 +1893,8 @@ impl SyncNode {
         let retained_tombstones: Vec<(String, StateRecord)> = sync_state
             .entries()
             .filter(|(path, record)| {
-                record.state == EntryState::Deleted.wire_value() as u8
+                self.selection.allows_path(path)
+                    && record.state == EntryState::Deleted.wire_value() as u8
                     && included.insert((*path).clone())
             })
             .map(|(path, record)| ((*path).clone(), record.clone()))
@@ -1699,7 +1914,8 @@ impl SyncNode {
 
     fn has_missing_tracked_path(&self, sync_state: &SyncStateStore) -> Result<bool> {
         for (path, record) in sync_state.entries() {
-            if record.state == EntryState::Active.wire_value() as u8
+            if self.selection.allows_path(path)
+                && record.state == EntryState::Active.wire_value() as u8
                 && !safe_target(&self.root, path)?.exists()
             {
                 return Ok(true);
@@ -2134,11 +2350,16 @@ fn send_get_root<S: Read + Write>(
     mux: &mut TunnelMux<'_, S>,
     connection_id: u32,
     root_hash: [u8; 20],
+    acl_hash: [u8; 20],
+    active_size: u64,
 ) -> Result<()> {
     write_peer_message(
         mux,
         connection_id,
         &Value::dict([
+            (b"acl_hash".to_vec(), Value::bytes(acl_hash)),
+            (b"active_size".to_vec(), Value::Int(active_size as i64)),
+            (b"exclusive_merge_connection".to_vec(), Value::Int(0)),
             (b"extra".to_vec(), Value::Dict(BTreeMap::new())),
             (b"force_full_merge".to_vec(), Value::Int(0)),
             (b"hash".to_vec(), Value::bytes(root_hash)),
@@ -2167,8 +2388,16 @@ fn send_get_files<S: Read + Write>(
     )
 }
 
-fn root_message(root_hash: [u8; 20], remote_time: Option<i64>) -> Value {
+fn root_message(
+    root_hash: [u8; 20],
+    remote_time: Option<i64>,
+    acl_hash: [u8; 20],
+    active_size: u64,
+) -> Value {
     Value::dict([
+        (b"acl_hash".to_vec(), Value::bytes(acl_hash)),
+        (b"active_size".to_vec(), Value::Int(active_size as i64)),
+        (b"exclusive_merge_connection".to_vec(), Value::Int(0)),
         (b"extra".to_vec(), Value::Dict(BTreeMap::new())),
         (b"force_full_merge".to_vec(), Value::Int(0)),
         (b"hash".to_vec(), Value::bytes(root_hash)),
@@ -2202,10 +2431,11 @@ fn send_get_nodes<S: Read + Write>(
     )
 }
 
-fn nodes_message_many(nodes: BTreeMap<Vec<u8>, Value>) -> Value {
+fn nodes_message_many(nodes: BTreeMap<Vec<u8>, Value>, offset: i64) -> Value {
     Value::dict([
         (b"m".to_vec(), Value::bytes(b"nodes")),
         (b"nodes".to_vec(), Value::Dict(nodes)),
+        (b"offset".to_vec(), Value::Int(offset)),
     ])
 }
 
@@ -2270,9 +2500,14 @@ fn piece_bitfield(piece_count: usize) -> Vec<u8> {
     bitfield
 }
 
-fn state_notify_message(root_hash: [u8; 20], files: &[LocalFile]) -> Value {
+fn state_notify_message(root_hash: [u8; 20], files: &[LocalFile], acl_hash: [u8; 20]) -> Value {
     let bitlist = have_pieces_bitlist(files);
     Value::dict([
+        (b"acl_hash".to_vec(), Value::bytes(acl_hash)),
+        (
+            b"active_size".to_vec(),
+            Value::Int(active_size(files) as i64),
+        ),
         (
             b"have_pieces_hash".to_vec(),
             Value::bytes(have_pieces_hash(root_hash, &bitlist)),
@@ -2282,13 +2517,30 @@ fn state_notify_message(root_hash: [u8; 20], files: &[LocalFile]) -> Value {
     ])
 }
 
-fn state_notify_requires_reconcile(message: &Value, local_root: [u8; 20]) -> Result<bool> {
+fn active_size(files: &[LocalFile]) -> u64 {
+    files
+        .iter()
+        .filter(|file| file.metadata.state == EntryState::Active)
+        .map(|file| file.metadata.size)
+        .sum()
+}
+
+fn state_notify_requires_reconcile(
+    message: &Value,
+    local_root: [u8; 20],
+    local_acl_hash: [u8; 20],
+) -> Result<bool> {
     let remote_root: [u8; 20] = message
         .get(b"tree_hash")?
         .as_bytes()?
         .try_into()
         .map_err(|_| anyhow::anyhow!("state_notify tree hash is not 20 bytes"))?;
-    Ok(remote_root != local_root)
+    let remote_acl_hash = message
+        .get(b"acl_hash")
+        .ok()
+        .and_then(|value| value.as_bytes().ok())
+        .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok());
+    Ok(remote_root != local_root || remote_acl_hash.unwrap_or_else(empty_hash) != local_acl_hash)
 }
 
 fn build_tree(files: &[LocalFile]) -> Result<FileTree> {
@@ -2568,7 +2820,12 @@ fn safe_target(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(root.join(relative))
 }
 
-fn collect_files(root: &Path, current: &Path, output: &mut Vec<String>) -> Result<()> {
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    selection: &SyncSelection,
+    output: &mut Vec<String>,
+) -> Result<()> {
     for item in fs::read_dir(current).with_context(|| format!("read {}", current.display()))? {
         let item = item?;
         let path = item.path();
@@ -2576,20 +2833,24 @@ fn collect_files(root: &Path, current: &Path, output: &mut Vec<String>) -> Resul
         if name == ".sync" {
             continue;
         }
-        let metadata = item.metadata()?;
+        if item.file_type()?.is_symlink() {
+            bail!("symlinks are not supported: {}", path.display());
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        let relative = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
         if metadata.is_dir() {
-            output.push(
-                path.strip_prefix(root)?
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
-            collect_files(root, &path, output)?;
-        } else if metadata.is_file() {
-            output.push(
-                path.strip_prefix(root)?
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
+            if !selection.allows_traversal(&relative, true) {
+                continue;
+            }
+            if selection.allows_path(&relative) {
+                output.push(relative);
+            }
+            collect_files(root, &path, selection, output)?;
+        } else if metadata.is_file() && selection.allows_path(&relative) {
+            output.push(relative);
         }
     }
     Ok(())
@@ -2844,6 +3105,42 @@ mod tests {
     }
 
     #[test]
+    fn selection_does_not_tombstone_unselected_tracked_paths() {
+        let root = tempdir().unwrap();
+        let included = root.path().join("included.txt");
+        let ignored = root.path().join("ignored.txt");
+        fs::write(&included, b"included").unwrap();
+        fs::write(&ignored, b"ignored").unwrap();
+        let selection = SyncSelection::new(Vec::<String>::new(), ["ignored.txt"]).unwrap();
+        let sync = test_sync(root.path()).with_selection(selection);
+        let mut state = SyncStateStore::load(root.path()).unwrap();
+        for (path, absolute) in [
+            ("included.txt", included.as_path()),
+            ("ignored.txt", ignored.as_path()),
+        ] {
+            let mut metadata =
+                FileMetadata::from_path(absolute, path, sync.identity.peer_id).unwrap();
+            metadata.sign(&sync.signing_key).unwrap();
+            let fingerprint = local_fingerprint(&metadata);
+            state.insert_local(&metadata, &fingerprint);
+        }
+        state.save().unwrap();
+        drop(state);
+        fs::remove_file(included).unwrap();
+        fs::remove_file(ignored).unwrap();
+
+        let files = sync
+            .scan_files(&mut SyncStateStore::load(root.path()).unwrap())
+            .unwrap();
+        let paths = files
+            .iter()
+            .map(|file| file.metadata.wire_path_string())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"included.txt".to_owned()));
+        assert!(!paths.contains(&"ignored.txt".to_owned()));
+    }
+
+    #[test]
     fn have_pieces_hash_matches_empty_and_single_file_vectors() {
         assert_eq!(
             have_pieces_hash([0; 20], &[]),
@@ -2898,11 +3195,53 @@ mod tests {
     fn changed_state_notify_reconciles_even_during_pending_requests() {
         let local_root = [1_u8; 20];
         let remote_root = [2_u8; 20];
-        let unchanged = state_notify_message(local_root, &[]);
-        let changed = state_notify_message(remote_root, &[]);
+        let unchanged = state_notify_message(local_root, &[], empty_hash());
+        let changed = state_notify_message(remote_root, &[], empty_hash());
+        let acl_changed = state_notify_message(local_root, &[], [3_u8; 20]);
 
-        assert!(!state_notify_requires_reconcile(&unchanged, local_root).unwrap());
-        assert!(state_notify_requires_reconcile(&changed, local_root).unwrap());
+        assert!(!state_notify_requires_reconcile(&unchanged, local_root, empty_hash()).unwrap());
+        assert!(state_notify_requires_reconcile(&changed, local_root, empty_hash()).unwrap());
+        assert!(state_notify_requires_reconcile(&acl_changed, local_root, empty_hash()).unwrap());
+    }
+
+    #[test]
+    fn acl_state_hash_is_carried_by_sync_node() {
+        let root = tempdir().unwrap();
+        let mut acl = AclState::default();
+        acl.insert(crate::acl::AclEntry::new(
+            1, 10, 1, [1_u8; 20], 11, [2_u8; 20],
+        ));
+        let expected = acl.hash();
+        let sync = test_sync(root.path()).with_acl_state(acl.clone());
+
+        assert_eq!(sync.acl_state(), &acl);
+        assert_eq!(sync.acl_hash, expected);
+    }
+
+    #[test]
+    fn upstream_merge_messages_include_acl_and_merge_fields() {
+        let message = root_message([4_u8; 20], Some(99), [5_u8; 20], 123);
+        assert_eq!(message.get(b"m").unwrap().as_bytes().unwrap(), b"root");
+        assert_eq!(
+            message.get(b"acl_hash").unwrap().as_bytes().unwrap(),
+            [5_u8; 20]
+        );
+        assert_eq!(message.get(b"active_size").unwrap().as_int().unwrap(), 123);
+        assert_eq!(
+            message
+                .get(b"exclusive_merge_connection")
+                .unwrap()
+                .as_int()
+                .unwrap(),
+            0
+        );
+
+        let notify = state_notify_message([4_u8; 20], &[], [5_u8; 20]);
+        assert_eq!(
+            notify.get(b"acl_hash").unwrap().as_bytes().unwrap(),
+            [5_u8; 20]
+        );
+        assert_eq!(notify.get(b"active_size").unwrap().as_int().unwrap(), 0);
     }
 
     fn baseline_record(metadata: &FileMetadata) -> StateRecord {

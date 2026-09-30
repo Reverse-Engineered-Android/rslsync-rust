@@ -95,10 +95,25 @@ the destination replacement.
 
 ## Current Limits
 
-- No tracker, relay, NAT traversal, or multi-source piece repair.
-- No selective sync, ignore patterns, or partial trees.
-- No encrypted-folder key rotation or encrypted-storage state format.
-- No owner/group/ACL synchronization; only file mode and mtime are applied.
+- The upstream compatibility path has no tracker, relay, NAT traversal, or
+  multi-source piece repair. The repository's independent HTTP tracker layer
+  (`src/tracker.rs`) is used for peer-candidate discovery by `SyncNode`; it is
+  not an upstream tracker wire implementation.
+- Selective sync is implemented for the standalone scan and `SyncNode` scan
+  paths through `src/selective.rs`; upstream wire negotiation does not carry a
+  remote selection policy.
+- Encrypted folders are an independent AES-256-GCM vault format in
+  `src/encrypted.rs`; key rotation and streaming chunk manifests are not part
+  of the v2 vault yet.
+- POSIX mode/uid/gid metadata is captured and enforceable in the standalone
+  manifest/vault APIs. The upstream wire metadata currently carries mode/mtime;
+  ACLs and cross-host user-name mapping remain outside the compatibility path.
+- ACL merge-controller message names, `acl_hash`, `active_size`,
+  `exclusive_merge_connection`, node offsets, and `get_files_next` are handled
+  for compatibility. Empty ACL folders complete the exchange; full upstream
+  certificate-chain, revoke, and managed-folder master/slave authorization
+  semantics remain a focused follow-up. A peer `not_master` event is handled as
+  a merge retry signal.
 - No full GUI/WebUI implementation.
 - A single peer session performs a complete reconciliation exchange and closes
   after a short settle interval; daemon modes repeat sessions and rescan.

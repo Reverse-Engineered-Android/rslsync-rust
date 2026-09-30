@@ -1,4 +1,5 @@
 use crate::model::{Entry, EntryKind, Manifest, PIECE_SIZE};
+use crate::selective::SyncSelection;
 use anyhow::{bail, Context, Result};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -9,11 +10,27 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub fn scan_root(root: &Path) -> Result<Manifest> {
+    scan_root_with_selection(root, &SyncSelection::all())
+}
+
+pub fn scan_root_with_selection(root: &Path, selection: &SyncSelection) -> Result<Manifest> {
     if !root.is_dir() {
         bail!("scan root is not a directory: {}", root.display());
     }
     let mut entries = Vec::new();
-    for item in WalkDir::new(root).sort_by_file_name().into_iter() {
+    for item in WalkDir::new(root)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|item| {
+            let relative = item.path().strip_prefix(root).unwrap_or(item.path());
+            if relative.as_os_str().is_empty() {
+                return true;
+            }
+            let path = relative.to_string_lossy().replace('\\', "/");
+            !path.split('/').any(|part| part == ".sync")
+                && selection.allows_traversal(&path, item.file_type().is_dir())
+        })
+    {
         let item = item.with_context(|| format!("walking {}", root.display()))?;
         let relative = item
             .path()
@@ -26,12 +43,15 @@ pub fn scan_root(root: &Path) -> Result<Manifest> {
         if path.split('/').any(|part| part == ".sync") {
             continue;
         }
+        if !selection.allows_path(&path) {
+            continue;
+        }
+        if item.file_type().is_symlink() {
+            bail!("symlinks are not supported: {}", item.path().display());
+        }
         let metadata = item
             .metadata()
             .with_context(|| format!("stat {}", item.path().display()))?;
-        if metadata.file_type().is_symlink() {
-            bail!("symlinks are not supported: {}", item.path().display());
-        }
         let mode = metadata.permissions().mode() & 0o7777;
         let mtime_seconds = metadata.mtime();
         if metadata.is_dir() {
@@ -40,6 +60,8 @@ pub fn scan_root(root: &Path) -> Result<Manifest> {
                 kind: EntryKind::Directory,
                 size: 0,
                 mode,
+                uid: Some(metadata.uid()),
+                gid: Some(metadata.gid()),
                 mtime_seconds,
                 file_hash: None,
                 pieces: vec![],
@@ -51,6 +73,8 @@ pub fn scan_root(root: &Path) -> Result<Manifest> {
                 kind: EntryKind::File,
                 size: metadata.len(),
                 mode,
+                uid: Some(metadata.uid()),
+                gid: Some(metadata.gid()),
                 mtime_seconds,
                 file_hash: Some(file_hash),
                 pieces,

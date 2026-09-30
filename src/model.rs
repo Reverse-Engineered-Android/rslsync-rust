@@ -19,6 +19,10 @@ pub struct Entry {
     pub kind: EntryKind,
     pub size: u64,
     pub mode: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
     pub mtime_seconds: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_hash: Option<String>,
@@ -126,6 +130,8 @@ mod tests {
             kind: EntryKind::Directory,
             size: 0,
             mode: 0o755,
+            uid: None,
+            gid: None,
             mtime_seconds: 1,
             file_hash: None,
             pieces: vec![],

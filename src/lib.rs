@@ -1,15 +1,20 @@
+pub mod acl;
 pub mod apply;
 pub mod bencode;
 pub mod discovery;
+pub mod encrypted;
 pub mod model;
 pub mod peer;
+pub mod permissions;
 pub mod protocol;
 pub mod scan;
 pub mod secret;
+pub mod selective;
 pub mod srpeh;
 pub mod state;
 pub mod sync_session;
 pub mod sync_state;
 pub mod tls;
+pub mod tracker;
 
 pub use model::{Entry, EntryKind, Manifest};
