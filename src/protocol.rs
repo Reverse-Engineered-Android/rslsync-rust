@@ -40,7 +40,7 @@ impl PeerIdentity {
         Ok(Self {
             name: name.into(),
             peer_id,
-            identity_key: key.ed25519_public_key()?,
+            identity_key: key.ed25519_public_key().unwrap_or([0; 32]),
             share_id: key.share_id(),
         })
     }

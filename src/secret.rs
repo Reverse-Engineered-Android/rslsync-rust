@@ -104,6 +104,18 @@ impl ShareKey {
         }
     }
 
+    pub fn read_only_link_key(&self) -> Result<Self> {
+        let body = self
+            .read_only_psk
+            .context("share key has no read-only compatibility key")?;
+        let key_type = if self.key_type == 'D' { 'E' } else { 'B' };
+        Ok(Self {
+            key_type,
+            body,
+            read_only_psk: Some(body),
+        })
+    }
+
     pub fn render(&self) -> String {
         format!("{}{}", self.key_type, encode_base32(&self.body))
     }
@@ -195,6 +207,10 @@ mod tests {
             ShareKey::parse(&key.render()).unwrap().tls_psk().unwrap(),
             key.tls_psk().unwrap()
         );
+        let read_only = key.read_only_link_key().unwrap();
+        assert_eq!(read_only.key_type, 'B');
+        assert_eq!(read_only.share_id(), key.share_id());
+        assert!(read_only.ed25519_signing_key().is_err());
     }
 
     #[test]

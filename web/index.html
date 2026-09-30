@@ -65,7 +65,7 @@
           <div class="section-heading">
             <div>
               <h2 id="folders-title">同步文件夹</h2>
-              <p>注册服务器可扫描的目录，并维护包含与排除规则。</p>
+              <p>创建 Standard Folder、导入共享链接，并维护自动、手动和选择性同步。</p>
             </div>
             <button id="refresh-folders-button" class="icon-button" type="button" title="刷新文件夹" aria-label="刷新文件夹">↻</button>
           </div>
@@ -87,6 +87,30 @@
             <label>
               排除规则
               <input id="folder-exclude" spellcheck="false" placeholder="可选，逗号分隔">
+            </label>
+            <label>
+              添加方式
+              <select id="folder-link-mode">
+                <option value="generate-rw">生成新的读写链接</option>
+                <option value="generate-ro">生成新的只读链接</option>
+                <option value="import">导入已有链接</option>
+              </select>
+            </label>
+            <label id="folder-link-field" class="hidden">
+              读写 / 只读共享链接
+              <input id="folder-link" spellcheck="false" autocomplete="off" placeholder="rustsync://... 或原始 A/B/D/E 密钥">
+            </label>
+            <label>
+              同步节点
+              <input id="folder-peers" spellcheck="false" placeholder="可选，逗号分隔，例如 192.168.1.20:22000">
+            </label>
+            <label>
+              自动同步间隔（秒）
+              <input id="folder-sync-interval" type="number" min="30" max="86400" value="300">
+            </label>
+            <label class="checkbox-label sync-checkbox">
+              <input id="folder-auto-sync" type="checkbox">
+              启用自动同步
             </label>
             <div class="folder-form-actions">
               <button id="folder-submit-button" class="primary-button" type="submit">添加文件夹</button>

@@ -1,3 +1,5 @@
+use crate::secret::ShareKey;
+use crate::sync_link::{SyncAccess, SyncLink};
 use anyhow::{bail, Context, Result};
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -13,7 +15,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 pub const DEFAULT_PASSWORD_EXEMPT_IPS: [&str; 2] = ["127.0.0.0/8", "::1/128"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,6 +40,31 @@ pub struct SyncFolder {
     pub created_at: u64,
     pub updated_at: u64,
     pub last_scan: Option<ScanSummary>,
+    #[serde(default)]
+    pub sync: Option<SyncSettings>,
+    #[serde(default)]
+    pub last_sync: Option<SyncRunRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncSettings {
+    pub key: String,
+    pub access: SyncAccess,
+    pub peers: Vec<String>,
+    pub auto_sync: bool,
+    pub sync_interval_seconds: u64,
+    pub device_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncRunRecord {
+    pub id: String,
+    pub folder_id: String,
+    pub trigger: String,
+    pub status: String,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +73,8 @@ pub struct PersistedServerState {
     pub password_hash: Option<String>,
     pub password_exempt_ips: Vec<String>,
     pub folders: Vec<SyncFolder>,
+    #[serde(default)]
+    pub sync_runs: Vec<SyncRunRecord>,
 }
 
 impl Default for PersistedServerState {
@@ -58,13 +87,14 @@ impl Default for PersistedServerState {
                 .map(|value| (*value).to_owned())
                 .collect(),
             folders: Vec::new(),
+            sync_runs: Vec::new(),
         }
     }
 }
 
 impl PersistedServerState {
     pub fn validate(&self) -> Result<()> {
-        if self.version != STATE_VERSION {
+        if self.version != 1 && self.version != STATE_VERSION {
             bail!(
                 "unsupported server state version {} (expected {})",
                 self.version,
@@ -76,6 +106,15 @@ impl PersistedServerState {
         let mut paths = BTreeSet::new();
         for folder in &self.folders {
             validate_folder_fields(folder)?;
+            if let Some(sync) = &folder.sync {
+                let key = ShareKey::parse(&sync.key).context("folder sync key")?;
+                if SyncAccess::from_key(&key) != sync.access {
+                    bail!("folder sync access does not match its share key");
+                }
+                if sync.sync_interval_seconds < 30 || sync.sync_interval_seconds > 86_400 {
+                    bail!("sync interval must be between 30 and 86400 seconds");
+                }
+            }
             if !ids.insert(folder.id.clone()) {
                 bail!("duplicate folder id {}", folder.id);
             }
@@ -105,8 +144,11 @@ impl ServerStateStore {
         let state = if path.exists() {
             let bytes =
                 fs::read(&path).with_context(|| format!("read server state {}", path.display()))?;
-            let state: PersistedServerState = serde_json::from_slice(&bytes)
+            let mut state: PersistedServerState = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse server state {}", path.display()))?;
+            if state.version == 1 {
+                state.version = STATE_VERSION;
+            }
             state.validate()?;
             state
         } else {
@@ -193,6 +235,7 @@ impl ServerStateStore {
 
     pub fn add_folder(&self, request: FolderRequest) -> Result<SyncFolder> {
         let path = canonical_directory(&request.path)?;
+        let sync = request.sync.map(build_sync_settings).transpose()?;
         let folder = SyncFolder {
             id: random_id(),
             name: request.name.trim().to_owned(),
@@ -203,6 +246,8 @@ impl ServerStateStore {
             created_at: unix_time(),
             updated_at: unix_time(),
             last_scan: None,
+            sync,
+            last_sync: None,
         };
         validate_folder_fields(&folder)?;
         self.update(|state| {
@@ -248,6 +293,11 @@ impl ServerStateStore {
             if let Some(enabled) = request.enabled {
                 folder.enabled = enabled;
             }
+            if let Some(sync) = request.sync {
+                folder.sync = sync
+                    .map(|request| build_sync_settings_with_base(request, folder.sync.as_ref()))
+                    .transpose()?;
+            }
             folder.updated_at = unix_time();
             validate_folder_fields(folder)?;
             let folder_id = folder.id.clone();
@@ -292,6 +342,94 @@ impl ServerStateStore {
             Ok(())
         })?;
         updated.context("folder scan update produced no result")
+    }
+
+    pub fn set_sync_settings(&self, id: &str, request: FolderSyncRequest) -> Result<SyncFolder> {
+        let mut updated = None;
+        self.update(|state| {
+            let folder = state
+                .folders
+                .iter_mut()
+                .find(|folder| folder.id == id)
+                .with_context(|| format!("folder not found: {id}"))?;
+            let settings = build_sync_settings_with_base(request, folder.sync.as_ref())?;
+            folder.sync = Some(settings.clone());
+            folder.updated_at = unix_time();
+            updated = Some(folder.clone());
+            Ok(())
+        })?;
+        updated.context("folder sync update produced no result")
+    }
+
+    pub fn record_sync_start(
+        &self,
+        id: &str,
+        run_id: &str,
+        trigger: &str,
+    ) -> Result<SyncRunRecord> {
+        let mut record = None;
+        self.update(|state| {
+            let folder = state
+                .folders
+                .iter_mut()
+                .find(|folder| folder.id == id)
+                .with_context(|| format!("folder not found: {id}"))?;
+            let run = SyncRunRecord {
+                id: run_id.to_owned(),
+                folder_id: id.to_owned(),
+                trigger: trigger.to_owned(),
+                status: "running".to_owned(),
+                started_at: unix_time(),
+                completed_at: None,
+                message: None,
+            };
+            folder.last_sync = Some(run.clone());
+            state.sync_runs.retain(|existing| existing.id != run.id);
+            state.sync_runs.push(run.clone());
+            state.sync_runs.truncate(100);
+            record = Some(run);
+            Ok(())
+        })?;
+        record.context("sync start update produced no result")
+    }
+
+    pub fn record_sync_finish(
+        &self,
+        run_id: &str,
+        status: &str,
+        message: Option<String>,
+    ) -> Result<SyncRunRecord> {
+        let mut record = None;
+        self.update(|state| {
+            let run = state
+                .sync_runs
+                .iter_mut()
+                .find(|run| run.id == run_id)
+                .with_context(|| format!("sync run not found: {run_id}"))?;
+            run.status = status.to_owned();
+            run.completed_at = Some(unix_time());
+            run.message = message.clone();
+            if let Some(folder) = state
+                .folders
+                .iter_mut()
+                .find(|folder| folder.id == run.folder_id)
+            {
+                folder.last_sync = Some(run.clone());
+            }
+            record = Some(run.clone());
+            Ok(())
+        })?;
+        record.context("sync finish update produced no result")
+    }
+
+    pub fn sync_runs(&self, folder_id: Option<&str>) -> Result<Vec<SyncRunRecord>> {
+        let state = self.state.lock().expect("server state lock poisoned");
+        Ok(state
+            .sync_runs
+            .iter()
+            .filter(|run| folder_id.is_none_or(|id| run.folder_id == id))
+            .cloned()
+            .collect())
     }
 
     fn update<T>(
@@ -345,6 +483,8 @@ pub struct FolderRequest {
     pub include: Option<String>,
     pub exclude: Option<String>,
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub sync: Option<FolderSyncRequest>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -354,6 +494,111 @@ pub struct FolderUpdate {
     pub include: Option<Option<String>>,
     pub exclude: Option<Option<String>>,
     pub enabled: Option<bool>,
+    pub sync: Option<Option<FolderSyncRequest>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FolderSyncRequest {
+    pub link: Option<String>,
+    pub key: Option<String>,
+    pub access: Option<SyncAccess>,
+    pub peers: Vec<String>,
+    pub auto_sync: Option<bool>,
+    pub sync_interval_seconds: u64,
+    pub device_name: String,
+}
+
+fn build_sync_settings(request: FolderSyncRequest) -> Result<SyncSettings> {
+    build_sync_settings_with_base(request, None)
+}
+
+fn build_sync_settings_with_base(
+    request: FolderSyncRequest,
+    base: Option<&SyncSettings>,
+) -> Result<SyncSettings> {
+    if request.link.is_some() && request.key.is_some() {
+        bail!("provide either link or key, not both");
+    }
+    let link = match (request.link, request.key) {
+        (Some(link), None) => SyncLink::parse(&link)?,
+        (None, Some(key)) => SyncLink::parse(&key)?,
+        (None, None) => {
+            let (access, key) = match base {
+                Some(settings) => {
+                    if request
+                        .access
+                        .is_some_and(|access| access != settings.access)
+                    {
+                        bail!("provide a new link to change existing folder access");
+                    }
+                    (settings.access, ShareKey::parse(&settings.key)?)
+                }
+                None => {
+                    let access = request.access.unwrap_or(SyncAccess::ReadWrite);
+                    let key = match access {
+                        SyncAccess::ReadWrite => ShareKey::generate_read_write(),
+                        SyncAccess::ReadOnly => ShareKey::generate_read_only(),
+                    };
+                    (access, key)
+                }
+            };
+            SyncLink {
+                key: key.render(),
+                access,
+                peers: request.peers.clone(),
+                device_name: Some(request.device_name.clone()),
+            }
+        }
+        (Some(_), Some(_)) => unreachable!(),
+    };
+    if let Some(access) = request.access {
+        if access != link.access {
+            bail!("requested sync access does not match the supplied link");
+        }
+    }
+    let mut peers = link.peers;
+    if request.peers.is_empty() {
+        if let Some(settings) = base {
+            peers.extend(settings.peers.iter().cloned());
+        }
+    } else {
+        peers.extend(request.peers);
+    }
+    peers.sort();
+    peers.dedup();
+    let sync_interval_seconds = if request.sync_interval_seconds == 0 {
+        base.map(|settings| settings.sync_interval_seconds)
+            .unwrap_or(300)
+    } else {
+        request.sync_interval_seconds
+    };
+    if !(30..=86_400).contains(&sync_interval_seconds) {
+        bail!("sync interval must be between 30 and 86400 seconds");
+    }
+    let requested_device_name = request.device_name.trim().to_owned();
+    let device_name = if requested_device_name.is_empty() {
+        link.device_name
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                base.map(|settings| settings.device_name.clone())
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| "rustsync".to_owned())
+    } else {
+        requested_device_name
+    };
+    Ok(SyncSettings {
+        key: link.key,
+        access: link.access,
+        peers,
+        auto_sync: request
+            .auto_sync
+            .or_else(|| base.map(|settings| settings.auto_sync))
+            .unwrap_or(false),
+        sync_interval_seconds,
+        device_name,
+    })
 }
 
 fn validate_folder_fields(folder: &SyncFolder) -> Result<()> {
@@ -502,6 +747,7 @@ mod tests {
                 include: Some("*.md".into()),
                 exclude: Some("private/**".into()),
                 enabled: Some(true),
+                sync: None,
             })
             .unwrap();
         let reloaded = ServerStateStore::load(temp.path().join("state.json")).unwrap();
@@ -519,5 +765,54 @@ mod tests {
             .unwrap();
         assert!(!updated.enabled);
         assert_eq!(reloaded.delete_folder(&folder.id).unwrap().id, folder.id);
+    }
+
+    #[test]
+    fn persists_sync_links_and_preserves_secret_when_updating_automation() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("folder");
+        fs::create_dir(&root).unwrap();
+        let store = ServerStateStore::load(temp.path().join("state.json")).unwrap();
+        let key = ShareKey::generate_read_write();
+        let folder = store
+            .add_folder(FolderRequest {
+                name: "Synced".into(),
+                path: root,
+                include: None,
+                exclude: Some("*.tmp".into()),
+                enabled: Some(true),
+                sync: Some(FolderSyncRequest {
+                    key: Some(key.render()),
+                    peers: vec!["127.0.0.1:22000".into()],
+                    auto_sync: Some(false),
+                    sync_interval_seconds: 60,
+                    ..FolderSyncRequest::default()
+                }),
+            })
+            .unwrap();
+        let original_key = folder.sync.as_ref().unwrap().key.clone();
+        let updated = store
+            .set_sync_settings(
+                &folder.id,
+                FolderSyncRequest {
+                    auto_sync: Some(true),
+                    sync_interval_seconds: 120,
+                    ..FolderSyncRequest::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.sync.as_ref().unwrap().key, original_key);
+        assert!(updated.sync.as_ref().unwrap().auto_sync);
+        assert_eq!(updated.sync.as_ref().unwrap().sync_interval_seconds, 120);
+
+        let started = store
+            .record_sync_start(&folder.id, "run-1", "manual")
+            .unwrap();
+        let finished = store
+            .record_sync_finish(&started.id, "success", Some("done".into()))
+            .unwrap();
+        assert_eq!(finished.status, "success");
+        let reloaded = ServerStateStore::load(temp.path().join("state.json")).unwrap();
+        assert_eq!(reloaded.sync_runs(Some(&folder.id)).unwrap().len(), 1);
     }
 }

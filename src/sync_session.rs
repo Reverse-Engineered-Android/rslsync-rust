@@ -107,8 +107,8 @@ impl DownloadSession {
 
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const LOCAL_UT_METADATA_ID: u8 = 3;
-const SYNC_SETTLE_SECONDS: u64 = 180;
-const PEER_IDLE_SECONDS: u64 = 300;
+const SYNC_SETTLE_SECONDS: u64 = 5;
+const PEER_IDLE_SECONDS: u64 = 30;
 const MERGE_NEGOTIATION_DELAY: Duration = Duration::from_secs(2);
 const MERGE_ROOT_RETRY: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,8 +249,9 @@ pub struct SyncNode {
     root: PathBuf,
     key: ShareKey,
     identity: PeerIdentity,
-    metadata_public_key: [u8; 32],
+    metadata_public_key: Option<[u8; 32]>,
     signing_key: SigningKey,
+    read_only: bool,
     selection: SyncSelection,
     trackers: Vec<String>,
     acl_hash: [u8; 20],
@@ -279,14 +280,18 @@ impl SyncNode {
             bail!("sync root is not a directory: {}", root.display());
         }
         let identity = PeerIdentity::from_key(device_name, &key, peer_id)?;
-        let signing_key = key.ed25519_signing_key()?;
-        let metadata_public_key = key.ed25519_public_key()?;
+        let read_only = matches!(key.key_type, 'B' | 'E');
+        let signing_key = key
+            .ed25519_signing_key()
+            .unwrap_or_else(|_| SigningKey::from_bytes(&rand::random()));
+        let metadata_public_key = key.ed25519_public_key().ok();
         Ok(Self {
             root,
             key,
             identity,
             metadata_public_key,
             signing_key,
+            read_only,
             selection: SyncSelection::all(),
             trackers: Vec::new(),
             acl_hash: empty_hash(),
@@ -533,11 +538,18 @@ impl SyncNode {
     pub fn run_connection<S: Read + Write>(&self, stream: &mut S, initiator: bool) -> Result<()> {
         let mut sync_state = SyncStateStore::load(&self.root)?;
         let mut local_files = self.scan_files(&mut sync_state)?;
-        let mut local_tree = build_tree(&local_files)?;
+        let mut published_files = if self.read_only {
+            Vec::new()
+        } else {
+            local_files.clone()
+        };
+        let mut local_tree = build_tree(&published_files)?;
         let mut root_hash = local_tree.root_hash;
-        let mut local_paths = top_level_paths(&local_files);
+        let mut local_paths = top_level_paths(&published_files);
         let mut remote_paths = BTreeSet::new();
         let mut remote_files: HashMap<String, FileMetadata> = HashMap::new();
+        let mut remote_public_keys: HashMap<u32, [u8; 32]> = HashMap::new();
+        let mut remote_public_key: Option<[u8; 32]> = None;
         let mut downloads: HashMap<u32, DownloadSession> = HashMap::new();
         let mut uploads: HashMap<u32, UploadSession> = HashMap::new();
         let mut wire_buffers: HashMap<u32, Vec<u8>> = HashMap::new();
@@ -599,7 +611,7 @@ impl SyncNode {
                     merge_connection,
                     root_hash,
                     self.acl_hash,
-                    active_size(&local_files),
+                    active_size(&published_files),
                 )?;
                 sent_get_root = true;
                 merge_in_flight = Some(merge_connection);
@@ -618,9 +630,14 @@ impl SyncNode {
             }
             if Instant::now() >= next_local_scan {
                 let refreshed_files = self.scan_files(&mut sync_state)?;
-                let refreshed_tree = build_tree(&refreshed_files)?;
+                let refreshed_published_files = if self.read_only {
+                    Vec::new()
+                } else {
+                    refreshed_files.clone()
+                };
+                let refreshed_tree = build_tree(&refreshed_published_files)?;
                 let refreshed_root = refreshed_tree.root_hash;
-                let refreshed_paths = top_level_paths(&refreshed_files);
+                let refreshed_paths = top_level_paths(&refreshed_published_files);
                 if refreshed_root != root_hash {
                     let changed_paths = changed_local_paths(&local_files, &refreshed_files);
                     let stale_downloads = downloads
@@ -662,7 +679,7 @@ impl SyncNode {
                                 &mut mux,
                                 connection_id,
                                 refreshed_root,
-                                &refreshed_files,
+                                &refreshed_published_files,
                             )?;
                         }
                     }
@@ -671,6 +688,7 @@ impl SyncNode {
                         Some(Instant::now() + Duration::from_secs(SYNC_SETTLE_SECONDS));
                 }
                 local_files = refreshed_files;
+                published_files = refreshed_published_files;
                 local_tree = refreshed_tree;
                 root_hash = refreshed_root;
                 local_paths = refreshed_paths;
@@ -680,7 +698,10 @@ impl SyncNode {
                 Ok(event) => event,
                 Err(error) if is_timeout(&error) => continue,
                 Err(error) if is_clean_tunnel_eof(&error) => {
-                    if received_files && downloads.is_empty() && uploads.is_empty() {
+                    if (received_files || (!self.read_only && !local_files.is_empty()))
+                        && downloads.is_empty()
+                        && uploads.is_empty()
+                    {
                         return Ok(());
                     }
                     if downloads.is_empty() && uploads.is_empty() {
@@ -846,6 +867,28 @@ impl SyncNode {
                             .context("PeerMessage has no type")?;
                         match message_type {
                             b"id" => {
+                                let public_key =
+                                    message.get(b"pk")?.as_bytes()?.try_into().map_err(|_| {
+                                        anyhow::anyhow!("peer identity key is not 32 bytes")
+                                    })?;
+                                let remote_share_id: [u8; 20] =
+                                    message.get(b"share")?.as_bytes()?.try_into().map_err(
+                                        |_| anyhow::anyhow!("peer share ID is not 20 bytes"),
+                                    )?;
+                                if remote_share_id != self.identity.share_id {
+                                    bail!("peer share ID does not match the configured share");
+                                }
+                                trace_sync(
+                                    "id",
+                                    &format!(
+                                        "conn={} pk={} share={}",
+                                        packet.connection_id,
+                                        hex::encode(public_key),
+                                        hex::encode(remote_share_id)
+                                    ),
+                                );
+                                remote_public_keys.insert(packet.connection_id, public_key);
+                                remote_public_key = Some(public_key);
                                 merge_connections.insert(packet.connection_id);
                             }
                             b"get_root" => {
@@ -875,7 +918,7 @@ impl SyncNode {
                                         root_hash,
                                         remote_time,
                                         self.acl_hash,
-                                        active_size(&local_files),
+                                        active_size(&published_files),
                                     ),
                                 )?;
                             }
@@ -1030,27 +1073,31 @@ impl SyncNode {
                                     self.send_files(
                                         &mut mux,
                                         packet.connection_id,
-                                        &local_files,
+                                        &published_files,
                                         &[],
                                     )?;
-                                    write_peer_message(
-                                        &mut mux,
-                                        packet.connection_id,
-                                        &have_pieces_message(root_hash, &local_files),
-                                    )?;
-                                    sent_file_manifest = true;
-                                    sent_get_root = false;
-                                }
-                                if requested_get_files != desired_paths {
-                                    trace_sync(
+                                    if requested_get_files != desired_paths {
+                                        trace_sync(
                                     "request_files",
                                     &format!(
                                         "conn={} desired={desired_paths:?} requested={requested_get_files:?}",
                                         packet.connection_id
                                     ),
                                 );
-                                    send_get_files(&mut mux, packet.connection_id, &desired_paths)?;
-                                    requested_get_files = desired_paths;
+                                        send_get_files(
+                                            &mut mux,
+                                            packet.connection_id,
+                                            &desired_paths,
+                                        )?;
+                                        requested_get_files = desired_paths;
+                                    }
+                                    write_peer_message(
+                                        &mut mux,
+                                        packet.connection_id,
+                                        &have_pieces_message(root_hash, &published_files),
+                                    )?;
+                                    sent_file_manifest = true;
+                                    sent_get_root = false;
                                 }
                             }
                             b"get_files" | b"get_files_next" => {
@@ -1074,8 +1121,22 @@ impl SyncNode {
                                 merge_connection = packet.connection_id;
                                 let list = message.get(b"files")?.as_list()?;
                                 let mut refreshed_remote_files = HashMap::new();
+                                let metadata_public_key = remote_public_keys
+                                    .get(&packet.connection_id)
+                                    .copied()
+                                    .or(remote_public_key)
+                                    .or(self.metadata_public_key)
+                                    .context("peer sent file metadata before its identity")?;
+                                trace_sync(
+                                    "files",
+                                    &format!(
+                                        "conn={} remote_key={}",
+                                        packet.connection_id,
+                                        hex::encode(metadata_public_key)
+                                    ),
+                                );
                                 for value in list {
-                                    let metadata = parse_file(value, &self.metadata_public_key)?;
+                                    let metadata = parse_file(value, &metadata_public_key)?;
                                     let path = metadata.wire_path_string();
                                     if self.selection.allows_path(&path) {
                                         refreshed_remote_files.insert(path, metadata);
@@ -1279,7 +1340,7 @@ impl SyncNode {
                                 write_peer_message(
                                     &mut mux,
                                     packet.connection_id,
-                                    &have_pieces_message(root_hash, &local_files),
+                                    &have_pieces_message(root_hash, &published_files),
                                 )?;
                             }
                             b"state_notify" => {
@@ -1435,6 +1496,9 @@ impl SyncNode {
             .iter()
             .find(|file| file.metadata.wire_path_string() == relative_path)
             .with_context(|| format!("DirectTorrent request for unknown file {relative_path}"))?;
+        if self.read_only {
+            bail!("read-only node cannot serve file content");
+        }
         if file.metadata.info_hash(&self.identity.share_id) != info_hash {
             bail!("DirectTorrent info hash mismatch for {relative_path}");
         }
@@ -1867,13 +1931,19 @@ impl SyncNode {
             });
         }
 
-        let missing: Vec<(String, StateRecord)> = sync_state
-            .entries()
-            .filter(|(path, record)| {
-                self.selection.allows_path(path) && !present.contains(*path) && record.state == 1
-            })
-            .map(|(path, record)| ((*path).clone(), record.clone()))
-            .collect();
+        let missing: Vec<(String, StateRecord)> = if self.read_only {
+            Vec::new()
+        } else {
+            sync_state
+                .entries()
+                .filter(|(path, record)| {
+                    self.selection.allows_path(path)
+                        && !present.contains(*path)
+                        && record.state == 1
+                })
+                .map(|(path, record)| ((*path).clone(), record.clone()))
+                .collect()
+        };
         for (path, previous) in missing {
             let mut metadata = state_record_metadata(&previous, &path)?;
             let fingerprint = local_fingerprint(&metadata);
@@ -1890,15 +1960,19 @@ impl SyncNode {
             .iter()
             .map(|file| file.metadata.wire_path_string())
             .collect();
-        let retained_tombstones: Vec<(String, StateRecord)> = sync_state
-            .entries()
-            .filter(|(path, record)| {
-                self.selection.allows_path(path)
-                    && record.state == EntryState::Deleted.wire_value() as u8
-                    && included.insert((*path).clone())
-            })
-            .map(|(path, record)| ((*path).clone(), record.clone()))
-            .collect();
+        let retained_tombstones: Vec<(String, StateRecord)> = if self.read_only {
+            Vec::new()
+        } else {
+            sync_state
+                .entries()
+                .filter(|(path, record)| {
+                    self.selection.allows_path(path)
+                        && record.state == EntryState::Deleted.wire_value() as u8
+                        && included.insert((*path).clone())
+                })
+                .map(|(path, record)| ((*path).clone(), record.clone()))
+                .collect()
+        };
         for (path, previous) in retained_tombstones {
             let metadata = state_record_metadata(&previous, &path)?;
             files.push(LocalFile {
@@ -1913,6 +1987,9 @@ impl SyncNode {
     }
 
     fn has_missing_tracked_path(&self, sync_state: &SyncStateStore) -> Result<bool> {
+        if self.read_only {
+            return Ok(false);
+        }
         for (path, record) in sync_state.entries() {
             if self.selection.allows_path(path)
                 && record.state == EntryState::Active.wire_value() as u8
@@ -1931,6 +2008,9 @@ impl SyncNode {
         files: &[LocalFile],
         paths: &[String],
     ) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let selected: Vec<&LocalFile> = files
             .iter()
             .filter(|file| {
@@ -2942,6 +3022,17 @@ mod tests {
         let key =
             ShareKey::parse(&format!("A{}", crate::secret::encode_base32(&[7_u8; 20]))).unwrap();
         SyncNode::new(root, key, "compat-test").unwrap()
+    }
+
+    #[test]
+    fn read_only_share_key_constructs_a_non_signing_sync_node() {
+        let root = tempdir().unwrap();
+        let key = ShareKey::generate_read_write()
+            .read_only_link_key()
+            .unwrap();
+        let sync = SyncNode::new(root.path(), key, "read-only-test").unwrap();
+        assert!(sync.read_only);
+        assert!(sync.metadata_public_key.is_none());
     }
 
     fn remote_metadata(relative: &str, content: &[u8]) -> (FileMetadata, TorrentMetadata) {

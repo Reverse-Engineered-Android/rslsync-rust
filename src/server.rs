@@ -2,9 +2,13 @@ use crate::operations::{
     self, ApplyRequest, DecryptTreeRequest, EncodePingRequest, EncryptTreeRequest,
     GenerateKeyRequest, InspectKeyRequest, PullRequest, ScanRequest, TrackerAnnounceRequest,
 };
+use crate::secret::ShareKey;
 use crate::server_state::{
-    FolderRequest, FolderUpdate, ServerStateStore, DEFAULT_PASSWORD_EXEMPT_IPS,
+    FolderRequest, FolderSyncRequest, FolderUpdate, ServerStateStore, SyncFolder, SyncSettings,
+    DEFAULT_PASSWORD_EXEMPT_IPS,
 };
+use crate::sync_link::SyncAccess;
+use crate::sync_manager::SyncManager;
 use anyhow::{Context, Result};
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -49,6 +53,7 @@ enum Principal {
 pub struct WebServer {
     http: Arc<HttpServer>,
     state: Arc<ServerStateStore>,
+    sync: SyncManager,
     sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
 }
 
@@ -56,10 +61,13 @@ impl WebServer {
     pub fn bind(options: ServerOptions) -> Result<Self> {
         let http = HttpServer::http(&options.listen)
             .map_err(|error| anyhow::anyhow!("bind web server: {error}"))?;
-        let state = ServerStateStore::load(options.state_path)?;
+        let state = Arc::new(ServerStateStore::load(options.state_path)?);
+        let sync = SyncManager::new(Arc::clone(&state));
+        sync.clone().start_scheduler();
         Ok(Self {
             http: Arc::new(http),
-            state: Arc::new(state),
+            state,
+            sync,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -83,6 +91,7 @@ impl WebServer {
                 let server = Self {
                     http: Arc::clone(&self.http),
                     state: Arc::clone(&self.state),
+                    sync: self.sync.clone(),
                     sessions: Arc::clone(&self.sessions),
                 };
                 thread::spawn(move || {
@@ -149,26 +158,66 @@ impl WebServer {
                 self.authorized(request, |server, _, _| server.list_folders())
             }
             ("POST", "/api/v1/folders") => self.authorized(request, |server, _, request| {
-                server.json_endpoint(request, |body: FolderRequest| server.state.add_folder(body))
+                match server.read_json::<FolderRequest>(request) {
+                    Ok(body) => folder_response(server.state.add_folder(body), true),
+                    Err(response) => response,
+                }
             }),
+            ("GET", "/api/v1/sync/runs") => {
+                self.authorized(request, |server, _, _| server.list_sync_runs(None))
+            }
+            ("POST", path)
+                if path.starts_with("/api/v1/folders/") && path.ends_with("/links/generate") =>
+            {
+                let id = folder_id_for_suffix(path, "/links/generate").to_owned();
+                self.authorized(request, |server, _, request| match server
+                    .read_json::<GenerateFolderLinkRequest>(request)
+                {
+                    Ok(body) => server.generate_folder_link(&id, body),
+                    Err(response) => response,
+                })
+            }
+            ("GET", path) if path.starts_with("/api/v1/folders/") && path.ends_with("/sync") => {
+                let id = folder_id_for_suffix(path, "/sync").to_owned();
+                self.authorized(request, |server, _, _| server.sync_status(&id))
+            }
+            ("POST", path) if path.starts_with("/api/v1/folders/") && path.ends_with("/sync") => {
+                let id = folder_id_for_suffix(path, "/sync").to_owned();
+                self.authorized(request, |server, _, _| server.start_manual_sync(&id))
+            }
+            ("PUT", path) if path.starts_with("/api/v1/folders/") && path.ends_with("/sync") => {
+                let id = folder_id_for_suffix(path, "/sync").to_owned();
+                self.authorized(request, |server, _, request| {
+                    match server.read_json::<FolderSyncRequest>(request) {
+                        Ok(body) => {
+                            folder_response(server.state.set_sync_settings(&id, body), true)
+                        }
+                        Err(response) => response,
+                    }
+                })
+            }
             ("GET", path) if path.starts_with("/api/v1/folders/") => {
                 let id = path.trim_start_matches("/api/v1/folders/");
                 self.authorized(request, |server, _, _| {
-                    json_result(server.state.get_folder(id))
+                    folder_response(server.state.get_folder(id), false)
                 })
             }
             ("PUT", path) if path.starts_with("/api/v1/folders/") => {
                 let id = path.trim_start_matches("/api/v1/folders/").to_owned();
                 self.authorized(request, |server, _, request| {
-                    server.json_endpoint(request, |body: FolderUpdate| {
-                        server.state.update_folder(&id, body)
-                    })
+                    match server.read_json::<FolderUpdate>(request) {
+                        Ok(body) => {
+                            let reveal_link = body.sync.is_some();
+                            folder_response(server.state.update_folder(&id, body), reveal_link)
+                        }
+                        Err(response) => response,
+                    }
                 })
             }
             ("DELETE", path) if path.starts_with("/api/v1/folders/") => {
                 let id = path.trim_start_matches("/api/v1/folders/").to_owned();
                 self.authorized(request, |server, _, _| {
-                    json_result(server.state.delete_folder(&id))
+                    folder_response(server.state.delete_folder(&id), false)
                 })
             }
             ("POST", path) if path.starts_with("/api/v1/folders/") && path.ends_with("/scan") => {
@@ -456,9 +505,100 @@ impl WebServer {
 
     fn list_folders(&self) -> Response<std::io::Cursor<Vec<u8>>> {
         match self.state.list_folders() {
-            Ok(folders) => json_response(200, &serde_json::json!({"folders": folders})),
+            Ok(folders) => json_response(
+                200,
+                &serde_json::json!({
+                    "folders": folders
+                        .into_iter()
+                        .map(|folder| public_folder(&folder))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
             Err(error) => internal_error(&error),
         }
+    }
+
+    fn start_manual_sync(&self, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+        match self.sync.start_manual(id) {
+            Ok(run) => json_response(202, &serde_json::json!({"run": run})),
+            Err(error) if error.to_string().contains("already running") => {
+                api_error(409, "sync_already_running", &error.to_string())
+            }
+            Err(error) => api_error(400, "sync_start_failed", &format!("{error:#}")),
+        }
+    }
+
+    fn sync_status(&self, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+        let folder = match self.state.get_folder(id) {
+            Ok(folder) => folder,
+            Err(error) => return not_found_or_internal(error),
+        };
+        match self.state.sync_runs(Some(id)) {
+            Ok(runs) => json_response(
+                200,
+                &serde_json::json!({
+                    "running": self.sync.is_running(id),
+                    "last_sync": folder.last_sync,
+                    "runs": runs,
+                }),
+            ),
+            Err(error) => internal_error(&error),
+        }
+    }
+
+    fn list_sync_runs(&self, folder_id: Option<&str>) -> Response<std::io::Cursor<Vec<u8>>> {
+        match self.state.sync_runs(folder_id) {
+            Ok(runs) => json_response(200, &serde_json::json!({"runs": runs})),
+            Err(error) => internal_error(&error),
+        }
+    }
+
+    fn generate_folder_link(
+        &self,
+        id: &str,
+        request: GenerateFolderLinkRequest,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let folder = match self.state.get_folder(id) {
+            Ok(folder) => folder,
+            Err(error) => return not_found_or_internal(error),
+        };
+        let mut peers = request.peers.clone();
+        if let Some(endpoint) = request.endpoint {
+            peers.push(endpoint);
+        }
+        peers.sort();
+        peers.dedup();
+        if request.access == SyncAccess::ReadOnly {
+            if let Some(settings) = &folder.sync {
+                let read_only_key = ShareKey::parse(&settings.key)
+                    .and_then(|key| key.read_only_link_key())
+                    .unwrap_or_else(|_| ShareKey::generate_read_only());
+                let mut link_peers = settings.peers.clone();
+                link_peers.extend(peers);
+                link_peers.sort();
+                link_peers.dedup();
+                let link = crate::sync_link::SyncLink {
+                    key: read_only_key.render(),
+                    access: SyncAccess::ReadOnly,
+                    peers: link_peers,
+                    device_name: Some(settings.device_name.clone()),
+                }
+                .render();
+                return folder_response_with_link(Ok(folder), Some(link));
+            }
+        }
+        let key = match request.access {
+            SyncAccess::ReadWrite => ShareKey::generate_read_write(),
+            SyncAccess::ReadOnly => ShareKey::generate_read_only(),
+        };
+        let settings_request = FolderSyncRequest {
+            key: Some(key.render()),
+            access: Some(request.access),
+            peers,
+            device_name: request.device_name.unwrap_or_default(),
+            ..FolderSyncRequest::default()
+        };
+        folder_response(self.state.set_sync_settings(id, settings_request), true)
     }
 
     fn scan_folder(&self, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -477,7 +617,7 @@ impl WebServer {
                 Ok(folder) => json_response(
                     200,
                     &serde_json::json!({
-                        "folder": folder,
+                        "folder": public_folder(&folder),
                         "scan": result.summary,
                     }),
                 ),
@@ -534,6 +674,88 @@ struct SettingsUpdate {
     password_exempt_ips: Option<Vec<String>>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct GenerateFolderLinkRequest {
+    access: SyncAccess,
+    endpoint: Option<String>,
+    peers: Vec<String>,
+    device_name: Option<String>,
+}
+
+fn folder_id_for_suffix<'a>(path: &'a str, suffix: &str) -> &'a str {
+    path.trim_start_matches("/api/v1/folders/")
+        .trim_end_matches(suffix)
+}
+
+fn folder_response(
+    result: Result<SyncFolder>,
+    reveal_link: bool,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let link = match (&result, reveal_link) {
+        (Ok(folder), true) => folder.sync.as_ref().map(render_folder_link),
+        _ => None,
+    };
+    folder_response_with_link(result, link)
+}
+
+fn folder_response_with_link(
+    result: Result<SyncFolder>,
+    link: Option<String>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    match result {
+        Ok(folder) => {
+            let folder_value = public_folder(&folder);
+            let mut value = folder_value.clone();
+            if let Some(link) = link {
+                value["link"] = serde_json::Value::String(link);
+            }
+            value["folder"] = folder_value;
+            json_response(200, &value)
+        }
+        Err(error) => not_found_or_internal(error),
+    }
+}
+
+fn public_folder(folder: &SyncFolder) -> serde_json::Value {
+    serde_json::json!({
+        "id": folder.id,
+        "name": folder.name,
+        "path": folder.path,
+        "include": folder.include,
+        "exclude": folder.exclude,
+        "enabled": folder.enabled,
+        "created_at": folder.created_at,
+        "updated_at": folder.updated_at,
+        "last_scan": folder.last_scan,
+        "last_sync": folder.last_sync,
+        "sync": folder.sync.as_ref().map(public_sync_settings),
+    })
+}
+
+fn public_sync_settings(settings: &SyncSettings) -> serde_json::Value {
+    let metadata = ShareKey::parse(&settings.key).ok();
+    serde_json::json!({
+        "access": settings.access,
+        "key_type": metadata.as_ref().map(|key| key.key_type),
+        "share_id": metadata.as_ref().map(|key| hex::encode(key.share_id())),
+        "peers": settings.peers,
+        "auto_sync": settings.auto_sync,
+        "sync_interval_seconds": settings.sync_interval_seconds,
+        "device_name": settings.device_name,
+    })
+}
+
+fn render_folder_link(settings: &SyncSettings) -> String {
+    crate::sync_link::SyncLink {
+        key: settings.key.clone(),
+        access: settings.access,
+        peers: settings.peers.clone(),
+        device_name: Some(settings.device_name.clone()),
+    }
+    .render()
+}
+
 fn json_result<T: Serialize>(result: Result<T>) -> Response<std::io::Cursor<Vec<u8>>> {
     match result {
         Ok(value) => json_response(200, &value),
@@ -543,6 +765,13 @@ fn json_result<T: Serialize>(result: Result<T>) -> Response<std::io::Cursor<Vec<
 
 fn static_asset(path: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let (body, content_type) = match path {
+        "/favicon.ico" => {
+            return Response::from_data(Vec::<u8>::new())
+                .with_status_code(StatusCode(200))
+                .with_header(
+                    Header::from_bytes("Content-Type", "image/x-icon".as_bytes()).unwrap(),
+                );
+        }
         "/" | "/index.html" => (
             include_str!("../web/index.html"),
             "text/html; charset=utf-8",
