@@ -97,6 +97,23 @@ pub fn apply_manifest_with_policy(
             )?;
         }
     }
+    // Writing or renaming a child refreshes the modification time of its
+    // parent directory, so directory timestamps can only be restored after
+    // every entry below them exists. Without this the applied tree keeps the
+    // fresh directory mtimes and its manifest root hash never matches the
+    // source, which makes peers re-sync trees that are already identical.
+    if policy.permissions != PermissionPolicy::CheckOnly {
+        for entry in manifest.entries.iter().rev() {
+            if entry.kind != EntryKind::Directory {
+                continue;
+            }
+            let target = target_root.join(&entry.path);
+            if !target.is_dir() {
+                continue;
+            }
+            filetime::set_file_mtime(&target, FileTime::from_unix_time(entry.mtime_seconds, 0))?;
+        }
+    }
     Ok(())
 }
 

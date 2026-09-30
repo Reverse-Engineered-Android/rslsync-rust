@@ -4,6 +4,7 @@ use rustsync::scan::{scan_root, scan_root_with_selection};
 use rustsync::selective::SyncSelection;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 
 #[test]
@@ -21,6 +22,15 @@ fn scans_and_applies_regular_files_atomically() {
         permissions.set_mode(0o640);
     }
     fs::set_permissions(source.path().join("origin/file.txt"), permissions).unwrap();
+    // Pin the directory timestamp to a fixed past value: writing a child
+    // refreshes a directory's mtime, so an apply that forgets to restore it
+    // would otherwise compare equal whenever both trees land in the same
+    // second and only fail at a second boundary.
+    let pinned = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    fs::File::open(source.path().join("origin"))
+        .unwrap()
+        .set_modified(pinned)
+        .unwrap();
 
     let manifest = scan_root(source.path()).unwrap();
     manifest.validate().unwrap();
@@ -38,6 +48,13 @@ fn scans_and_applies_regular_files_atomically() {
     let source_hash = scan_root(source.path()).unwrap().root_hash;
     let target_hash = scan_root(target.path()).unwrap().root_hash;
     assert_eq!(source_hash, target_hash);
+    assert_eq!(
+        fs::metadata(target.path().join("origin"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        pinned
+    );
 }
 
 #[test]
