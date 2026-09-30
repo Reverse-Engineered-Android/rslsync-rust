@@ -22,6 +22,24 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Binary Releases
+
+The release workflow builds static Linux executables and Debian packages for
+the following architectures:
+
+| Architecture | Rust target | Debian architecture |
+| ------------ | ----------- | ------------------- |
+| x86_64 | `x86_64-unknown-linux-musl` | `amd64` |
+| aarch64 | `aarch64-unknown-linux-musl` | `arm64` |
+| riscv64 | `riscv64gc-unknown-linux-musl` | `riscv64` |
+| LoongArch64 new world | `loongarch64-unknown-linux-musl` | `loong64` |
+
+Pushing a `v<version>` tag that matches `Cargo.toml` publishes both the raw
+executable and `.deb` files to the matching GitHub release. The LoongArch build
+uses the upstream Linux LP64D ABI (kernel 5.19+, musl 1.2.5) and is therefore
+intended for the new-world ABI. OpenSSL is vendored and statically linked so
+the executable does not require a system OpenSSL installation.
+
 Scan and atomically apply a tree with the standalone core:
 
 ```bash

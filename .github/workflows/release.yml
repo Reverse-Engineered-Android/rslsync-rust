@@ -1,0 +1,209 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing v* tag to rebuild and publish (leave empty for artifacts only)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CROSS_REV: 74e99b2223de06166f8cdcc1af7f1308ec52baf4
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: release
+        name: Validate version and release tag
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          if [[ ! "$version" =~ ^[0-9][A-Za-z0-9.+:~-]*$ ]]; then
+            echo "invalid Cargo package version: $version" >&2
+            exit 1
+          fi
+
+          tag=""
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag="$GITHUB_REF_NAME"
+          elif [[ -n "${REQUESTED_TAG:-}" ]]; then
+            tag="$REQUESTED_TAG"
+          fi
+
+          if [[ -n "$tag" ]]; then
+            if [[ "$tag" != "v$version" ]]; then
+              echo "tag $tag does not match Cargo version v$version" >&2
+              exit 1
+            fi
+            tag_commit="$(git rev-list -n 1 "$tag")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "tag $tag points to $tag_commit, expected $GITHUB_SHA" >&2
+              exit 1
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-test
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all-targets --locked
+
+  build:
+    name: build-${{ matrix.asset }}
+    needs: [metadata, test]
+    runs-on: ubuntu-latest
+    env:
+      OPENSSL_STATIC: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: x86_64
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-musl
+            asset: aarch64
+            deb_arch: arm64
+          - target: riscv64gc-unknown-linux-musl
+            asset: riscv64
+            deb_arch: riscv64
+          - target: loongarch64-unknown-linux-musl
+            asset: loongarch64-newworld
+            deb_arch: loong64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Cache cross
+        id: cache-cross
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-${{ env.CROSS_REV }}
+      - name: Install cross
+        if: steps.cache-cross.outputs.cache-hit != 'true'
+        run: >
+          cargo install cross
+          --git https://github.com/cross-rs/cross
+          --rev "$CROSS_REV"
+          --locked
+      - name: Build static executable
+        run: cross build --release --locked --target "${{ matrix.target }}"
+      - name: Smoke-test executable
+        run: >
+          cross run
+          --release
+          --locked
+          --target "${{ matrix.target }}"
+          -- --help
+      - name: Verify static linkage
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/rustsync"
+          file "$binary"
+          if readelf -d "$binary" | grep -q '(NEEDED)'; then
+            echo "release executable unexpectedly requires shared libraries" >&2
+            exit 1
+          fi
+      - name: Package executable and Debian archive
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          executable="rustsync-${VERSION}-linux-${{ matrix.asset }}"
+          install -Dm0755 "target/${{ matrix.target }}/release/rustsync" "dist/${executable}"
+          .github/scripts/package-deb.sh \
+            "$VERSION" \
+            "${{ matrix.deb_arch }}" \
+            "target/${{ matrix.target }}/release/rustsync" \
+            dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustsync-${{ matrix.asset }}
+          path: |
+            dist/rustsync-${{ needs.metadata.outputs.version }}-linux-${{ matrix.asset }}
+            dist/rustsync_${{ needs.metadata.outputs.version }}_${{ matrix.deb_arch }}.deb
+          if-no-files-found: error
+
+  publish:
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assemble checksums
+        run: |
+          set -euo pipefail
+          count="$(find dist -maxdepth 1 -type f | wc -l)"
+          if [[ "$count" -ne 8 ]]; then
+            echo "expected 8 release files, found $count" >&2
+            exit 1
+          fi
+          mapfile -t files < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          (
+            cd dist
+            sha256sum "${files[@]}" > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish GitHub release
+        if: needs.metadata.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "rustsync $RELEASE_VERSION" \
+              --generate-notes \
+              --repo "$GITHUB_REPOSITORY" \
+              dist/*
+          fi
