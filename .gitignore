@@ -1,0 +1,11 @@
+/target/
+.sync/
+__pycache__/
+*.pyc
+compat-work/
+.srpeh-trace.gdb
+*.swp
+*.log
+.env
+.rustsync-manifest.json
+.rustsync-staging-*
