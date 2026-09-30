@@ -85,6 +85,8 @@ jobs:
     needs: [metadata, test]
     runs-on: ubuntu-latest
     env:
+      CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static"
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static"
       OPENSSL_STATIC: "1"
     strategy:
       fail-fast: false
