@@ -90,9 +90,10 @@ writes the normal `.rustsync-manifest.json` manifest below its root and stores
 the scan summary in server state.
 
 Set `"sync": {"link": "<raw key or rustsync URI>"}` to import a Standard
-Folder. Supported link keys are `A`/`D` for read-write, `B`/`E` for
-read-only, and `F` for encrypted-only. `G`/`H` Advanced Folder keys are
-rejected. A URI can carry explicit peers:
+Folder, or `"sync": {"access": "read-write"}` to generate a fresh read-write
+key. Supported link keys are `A`/`D` for read-write, `B`/`E` for read-only, and
+`F` for encrypted-only. `G`/`H` Advanced Folder keys are rejected. A URI can
+carry explicit peers:
 
 ```text
 rustsync://A...?access=read-write&peer=192.168.1.20%3A22000&device=desktop
@@ -100,10 +101,17 @@ rustsync://A...?access=read-write&peer=192.168.1.20%3A22000&device=desktop
 
 Folder listings expose `keys` for the current role so the web console can show
 the corresponding read-write, read-only, and encrypted keys. A `D` folder
-shows `D/E/F`; an `E` folder shows `E/F`. Treat these values as secrets and do
-not expose the API without HTTPS and access controls. The `links/generate`
-endpoint derives the requested role from the existing `D`/`E` key without
-changing the folder's role.
+shows `D/E/F`; an `E` folder shows `E/F`; an `F` folder shows only the
+encrypted key. Treat these values as secrets and do not expose the API without
+HTTPS and access controls. The `links/generate` endpoint derives the requested
+role from the existing `D`/`E` key without changing the folder's role, and a
+`POST /api/v1/folders` response carries the matching `link` beside `folder`.
+
+Rejected input is reported with a status that names the problem instead of a
+generic `500`: `400 invalid_key` for an unsupported or underivable share key,
+`400 invalid_request` for a malformed request (an empty link, a relative or
+missing folder path, an out-of-range sync interval, an access that contradicts
+the key), and `409 conflict` for a folder path that is already registered.
 
 `POST .../sync` starts a manual run and returns `202` with a run record. The
 other two `sync` endpoints return run status/history and update automatic

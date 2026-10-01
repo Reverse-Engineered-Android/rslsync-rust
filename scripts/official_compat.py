@@ -1434,6 +1434,8 @@ def main():
             "encrypted-only-official-responder",
             "read-only-relay-serve",
             "read-only-relay-read",
+            "standard-read-only",
+            "standard-read-only-upstream",
         ),
         default="all",
     )
@@ -1467,6 +1469,29 @@ def main():
     # `D`/`E` peers. The two encrypted-only cases cover one direction each.
     cases = {
         "standard": ("standard-A", "standard", "A", None, None, None, False),
+        # The other half of the Standard Folder `A/B` family: the official peer
+        # writes with `A`, the Rust peer reads with the derived `B` link key.
+        # `B` carries no Ed25519 seed, so it must receive content and publish
+        # nothing, exactly like the encrypt-capable `E` role.
+        "standard-read-only": (
+            "standard-B",
+            "standard",
+            "A",
+            "read-only",
+            None,
+            "read-only",
+            False,
+        ),
+        # Mirror: Rust writes with `A`, the official peer reads with `B`.
+        "standard-read-only-upstream": (
+            "standard-B-upstream",
+            "standard",
+            "B",
+            None,
+            "read-only",
+            "read-only-writer",
+            False,
+        ),
         "encrypt-capable": (
             "encrypted-D",
             "encrypt-capable",
@@ -1584,6 +1609,8 @@ def main():
         "encrypted-only-official-responder",
         "read-only-relay-serve",
         "read-only-relay-read",
+        "standard-read-only",
+        "standard-read-only-upstream",
     )
     selected = (
         [cases[name] for name in default_cases]

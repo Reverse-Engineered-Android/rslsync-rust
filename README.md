@@ -160,7 +160,11 @@ For two-way upstream interoperability use an `A` or `D` read-write key. `B` and
 metadata. `F` is the encrypted-only role and cannot decrypt local file content.
 `A/B` share IDs are `SHA-1(access-key)`; `D/E/F` share IDs are the first 20
 bytes of `Keccak-256(access-key)`. `D` derives `E` and `F`; `E` derives `F`.
-The web console displays the derived role keys for `D` and `E` folders.
+The web console can add a folder from an existing key or generate a fresh
+read-write key, and displays every derived role the key exposes: a `D` folder
+shows read-write, read-only and encrypted keys, an `E` folder shows read-only
+and encrypted, and a `B`/`F` folder shows the read-only or encrypted key it
+already holds.
 
 ## Upstream Modes
 

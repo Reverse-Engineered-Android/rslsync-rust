@@ -18,45 +18,8 @@ pub struct ShareKey {
     pub body: Vec<u8>,
 }
 
-/// A share key the caller supplied that this implementation deliberately
-/// rejects: an Advanced Folder key, an unknown key type, a malformed body, or
-/// a role that cannot be derived from the given key. These are caller errors,
-/// not server faults, so the HTTP layer maps them to 400 instead of 500.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InvalidKeyError {
-    message: String,
-}
-
-impl InvalidKeyError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl std::fmt::Display for InvalidKeyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for InvalidKeyError {}
-
-/// Build an `InvalidKeyError` and wrap it into the `anyhow` error the rest of
-/// the crate propagates, so `downcast_ref` can recover it at the HTTP edge.
-fn invalid_key(message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(InvalidKeyError::new(message))
-}
-
-/// Recover a caller-supplied-key rejection from a propagated error chain.
-pub fn invalid_key_error(error: &anyhow::Error) -> Option<&InvalidKeyError> {
-    error.downcast_ref::<InvalidKeyError>()
-}
+/// Re-exported so key parsing and the HTTP edge share one caller-error type.
+pub use crate::caller_error::{caller_error_from, invalid_key, CallerError};
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct DerivedShareKeys {

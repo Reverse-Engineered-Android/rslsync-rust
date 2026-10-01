@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod apply;
 pub mod bencode;
+pub mod caller_error;
 pub mod client;
 pub mod discovery;
 pub mod encrypted;

@@ -1,3 +1,4 @@
+use crate::caller_error::{conflict, invalid_request, reclassify};
 use crate::secret::ShareKey;
 use crate::sync_link::{SyncAccess, SyncLink};
 use anyhow::{bail, Context, Result};
@@ -256,10 +257,10 @@ impl ServerStateStore {
                 .iter()
                 .any(|existing| normalized_path(&existing.path) == normalized_path(&folder.path))
             {
-                bail!(
+                return Err(conflict(format!(
                     "folder path is already registered: {}",
                     folder.path.display()
-                );
+                )));
             }
             state.folders.push(folder.clone());
             state
@@ -307,7 +308,9 @@ impl ServerStateStore {
                 candidate.id != folder_id && normalized_path(&candidate.path) == folder_path
             });
             if duplicate {
-                bail!("folder path is already registered: {folder_path}");
+                return Err(conflict(format!(
+                    "folder path is already registered: {folder_path}"
+                )));
             }
             Ok(())
         })?;
@@ -518,7 +521,7 @@ fn build_sync_settings_with_base(
     base: Option<&SyncSettings>,
 ) -> Result<SyncSettings> {
     if request.link.is_some() && request.key.is_some() {
-        bail!("provide either link or key, not both");
+        return Err(invalid_request("provide either link or key, not both"));
     }
     let link = match (request.link, request.key) {
         (Some(link), None) => SyncLink::parse(&link)?,
@@ -530,7 +533,9 @@ fn build_sync_settings_with_base(
                         .access
                         .is_some_and(|access| access != settings.access)
                     {
-                        bail!("provide a new link to change existing folder access");
+                        return Err(invalid_request(
+                            "provide a new link to change existing folder access",
+                        ));
                     }
                     (settings.access, ShareKey::parse(&settings.key)?)
                 }
@@ -540,7 +545,9 @@ fn build_sync_settings_with_base(
                         SyncAccess::ReadWrite => ShareKey::generate_read_write(),
                         SyncAccess::ReadOnly => ShareKey::generate_read_only(),
                         SyncAccess::EncryptedOnly => {
-                            bail!("encrypted-only folders cannot be generated without a D or E key")
+                            return Err(invalid_request(
+                                "encrypted-only folders cannot be generated without a D or E key",
+                            ));
                         }
                     };
                     (access, key)
@@ -557,7 +564,9 @@ fn build_sync_settings_with_base(
     };
     if let Some(access) = request.access {
         if access != link.access {
-            bail!("requested sync access does not match the supplied link");
+            return Err(invalid_request(
+                "requested sync access does not match the supplied link",
+            ));
         }
     }
     let mut peers = link.peers;
@@ -577,7 +586,9 @@ fn build_sync_settings_with_base(
         request.sync_interval_seconds
     };
     if !(30..=86_400).contains(&sync_interval_seconds) {
-        bail!("sync interval must be between 30 and 86400 seconds");
+        return Err(invalid_request(
+            "sync interval must be between 30 and 86400 seconds",
+        ));
     }
     let requested_device_name = request.device_name.trim().to_owned();
     let device_name = if requested_device_name.is_empty() {
@@ -606,13 +617,15 @@ fn build_sync_settings_with_base(
 
 fn validate_folder_fields(folder: &SyncFolder) -> Result<()> {
     if folder.name.trim().is_empty() {
-        bail!("folder name cannot be empty");
+        return Err(invalid_request("folder name cannot be empty"));
     }
     if folder.id.len() != 32 || !folder.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("folder id must be 16 random bytes encoded as hexadecimal");
+        return Err(invalid_request(
+            "folder id must be 16 random bytes encoded as hexadecimal",
+        ));
     }
     if !folder.path.is_absolute() {
-        bail!("folder path must be absolute");
+        return Err(invalid_request("folder path must be absolute"));
     }
     if let Some(include) = folder.include.as_deref() {
         validate_patterns(include)?;
@@ -626,10 +639,13 @@ fn validate_folder_fields(folder: &SyncFolder) -> Result<()> {
 fn canonical_directory(path: impl AsRef<Path>) -> Result<PathBuf> {
     let path = path.as_ref();
     if !path.is_absolute() {
-        bail!("folder path must be absolute");
+        return Err(invalid_request("folder path must be absolute"));
     }
     if !path.is_dir() {
-        bail!("folder path is not a directory: {}", path.display());
+        return Err(invalid_request(format!(
+            "folder path is not a directory: {}",
+            path.display()
+        )));
     }
     path.canonicalize()
         .with_context(|| format!("canonicalize folder path {}", path.display()))
@@ -648,8 +664,10 @@ fn normalize_optional_patterns(value: Option<&str>) -> Result<Option<String>> {
 }
 
 fn validate_patterns(value: &str) -> Result<()> {
-    crate::selective::SyncSelection::from_csv(Some(value), None)?;
-    Ok(())
+    reclassify(
+        crate::selective::SyncSelection::from_csv(Some(value), None).map(|_| ()),
+        format!("invalid selection pattern {value:?}"),
+    )
 }
 
 fn normalize_exempt_ips(values: &[String]) -> Result<Vec<String>> {

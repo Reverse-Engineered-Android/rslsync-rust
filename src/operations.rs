@@ -143,26 +143,36 @@ pub fn generate_key(request: GenerateKeyRequest) -> Result<GenerateKeyResponse> 
             Some("encrypted") => source.encrypted_link_key()?,
             Some("read-write") => {
                 if !source.is_read_write() {
-                    bail!(
+                    return Err(crate::caller_error::invalid_key(format!(
                         "{} keys cannot derive a read-write link key",
                         source.key_type
-                    );
+                    )));
                 }
                 source
             }
-            Some(other) => bail!("unsupported derived key role {other}"),
+            Some(other) => {
+                return Err(crate::caller_error::invalid_request(format!(
+                    "unsupported derived key role {other}"
+                )))
+            }
         }
     } else {
         match (request.read_write, request.key_family.as_deref()) {
             (false, None | Some("standard")) => ShareKey::generate_read_only(),
             (false, Some(other)) => {
-                bail!("read-only generation only supports the standard key family, got {other}")
+                return Err(crate::caller_error::invalid_request(format!(
+                    "read-only generation only supports the standard key family, got {other}"
+                )))
             }
             (true, None | Some("encrypt-capable") | Some("encrypted")) => {
                 ShareKey::generate_encrypt_capable_read_write()
             }
             (true, Some("standard")) => ShareKey::generate_standard_read_write(),
-            (true, Some(other)) => bail!("unsupported key family {other}"),
+            (true, Some(other)) => {
+                return Err(crate::caller_error::invalid_request(format!(
+                    "unsupported key family {other}"
+                )))
+            }
         }
     };
     Ok(GenerateKeyResponse {

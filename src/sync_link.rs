@@ -1,5 +1,6 @@
+use crate::caller_error::invalid_request;
 use crate::secret::ShareKey;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -41,7 +42,7 @@ impl SyncLink {
     pub fn parse(value: &str) -> Result<Self> {
         let value = value.trim();
         if value.is_empty() {
-            bail!("sync link cannot be empty");
+            return Err(invalid_request("sync link cannot be empty"));
         }
         if !value.contains("://") {
             let key = ShareKey::parse(value)?;
@@ -56,7 +57,9 @@ impl SyncLink {
             .split_once("://")
             .context("sync link is missing ://")?;
         if scheme != "rustsync" {
-            bail!("unsupported sync link scheme {scheme}");
+            return Err(invalid_request(format!(
+                "unsupported sync link scheme {scheme}"
+            )));
         }
         let (authority, query) = match rest.split_once('?') {
             Some((authority, query)) => (authority, Some(query)),
@@ -88,7 +91,11 @@ impl SyncLink {
                             "read-write" | "rw" => SyncAccess::ReadWrite,
                             "read-only" | "ro" => SyncAccess::ReadOnly,
                             "encrypted-only" | "encrypted" => SyncAccess::EncryptedOnly,
-                            other => bail!("unsupported sync link access {other}"),
+                            other => {
+                                return Err(invalid_request(format!(
+                                    "unsupported sync link access {other}"
+                                )))
+                            }
                         };
                     }
                     _ => {}
@@ -97,7 +104,9 @@ impl SyncLink {
         }
         let key_access = SyncAccess::from_key(&key);
         if access != key_access {
-            bail!("sync link access does not match its share key");
+            return Err(invalid_request(
+                "sync link access does not match its share key",
+            ));
         }
         Ok(Self {
             key: key.render(),

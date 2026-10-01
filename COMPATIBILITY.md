@@ -21,7 +21,7 @@ Upstream tunnel/merge/DirectTorrent traffic.
 | Concurrent edit/conflict | Compatible | Local value retained as `.Conflict`/`.ConflictN`; remote installed |
 | Periodic reconnect and rescan | Compatible | Dial and accept paths rerun scan/reconciliation per session |
 | Legacy TLS-PSK transport | Retained | Compatibility transport for older protocol paths |
-| Standard Folder `A/B` key family | Compatible | SHA-1 share identity and read-only enforcement |
+| Standard Folder `A/B` key family | Compatible | `standard-B`/`standard-B-upstream` gates: official writes, Rust `B` reads, and the reverse |
 | Standard Folder `D/E/F` key family | Implemented | Key derivation, role links, and official content transform |
 | Encrypted-only `F` peers, both roles | Compatible | `F` dials and answers `D`/`E`; ciphertext name and bytes verified |
 | Read-only `E` relay to/from `F` | Compatible | `E` serves the writer's signed entry to `F`; `E` decrypts from an `F` responder |
@@ -32,6 +32,8 @@ upstream client 3.1.2 (build 1076):
 
 ```text
 standard-A                        (standard folder, writable A key)
+standard-B                        (official A writes, Rust B reads)
+standard-B-upstream               (Rust A writes, official B reads)
 encrypted-D                       (encrypted folder, writable D key)
 read-only-E                       (official D writes, Rust E reads)
 read-only-E-upstream              (Rust D writes, official E reads)
@@ -44,7 +46,10 @@ read-only-E-reads-official-F      (read-only E decrypts from an F responder)
 ```
 
 Every case in this list is a hard gate in the default `--key-family all` run;
-the encrypted-only and read-only-relay cases are not opt-in.
+the encrypted-only, read-only-relay, and standard read-only cases are not
+opt-in. Both halves of the Standard Folder `A/B` family are covered, so the
+read-only role is verified against the official client rather than assumed from
+the writable one.
 
 Run the matrix with `scripts/official_compat.py`, supplying a local official
 binary and an empty work directory. The script creates temporary roots and a

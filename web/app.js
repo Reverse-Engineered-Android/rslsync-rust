@@ -227,13 +227,26 @@ function iconButton(symbol, label, action) {
   return button;
 }
 
+// Clipboard access is denied in insecure contexts, when the document is not
+// focused, or by user settings. Copying is a convenience, so a failure must
+// never abort the action that produced the value (a created folder still has
+// to appear in the list).
+async function copyToClipboard(value) {
+  try {
+    await navigator.clipboard?.writeText(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function copyKey(value) {
   if (!value) {
     return;
   }
-  await navigator.clipboard?.writeText(value);
+  const copied = await copyToClipboard(value);
   elements.toolOutput.textContent = value;
-  showToast("密钥已复制。");
+  showToast(copied ? "密钥已复制。" : "密钥已显示，请手动复制。");
 }
 
 function editFolder(folder) {
@@ -348,23 +361,6 @@ async function updateAutoSync(folder, enabled) {
   } catch (error) {
     showToast(error.message, true);
     await loadFolders();
-  }
-}
-
-async function generateFolderLink(id, access) {
-  try {
-    const result = await api(`/api/v1/folders/${id}/links/generate`, {
-      method: "POST",
-      body: JSON.stringify({ access }),
-    });
-    const link = result.folder.link;
-    await navigator.clipboard?.writeText(link);
-    elements.toolOutput.textContent = link;
-    elements.toolOutput.scrollIntoView({ behavior: "smooth", block: "center" });
-    showToast(`${access === "read-write" ? "读写" : "只读"}链接已生成并复制。`);
-    await loadFolders();
-  } catch (error) {
-    showToast(error.message, true);
   }
 }
 
@@ -486,10 +482,14 @@ elements.folderForm.addEventListener("submit", async (event) => {
         method: "POST",
         body: JSON.stringify({ ...payload, enabled: true }),
       });
-      if (result.folder.link) {
-        await navigator.clipboard?.writeText(result.folder.link);
-        elements.toolOutput.textContent = result.folder.link;
-        showToast("文件夹已添加，共享链接已生成并复制。");
+      if (result.link) {
+        const copied = await copyToClipboard(result.link);
+        elements.toolOutput.textContent = result.link;
+        showToast(
+          copied
+            ? "文件夹已添加，共享链接已生成并复制。"
+            : "文件夹已添加，共享链接已生成，请手动复制。",
+        );
       } else {
         showToast("文件夹已添加。");
       }

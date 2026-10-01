@@ -244,9 +244,11 @@ impl WebServer {
             }
             ("POST", "/api/v1/operations/keys/generate") => {
                 self.authorized(request, |server, _, request| {
-                    server.json_endpoint(request, |body: GenerateKeyRequest| {
-                        operations::generate_key(body)
-                    })
+                    server.json_endpoint_with(
+                        request,
+                        |body: GenerateKeyRequest| operations::generate_key(body),
+                        invalid_key_error,
+                    )
                 })
             }
             ("POST", "/api/v1/operations/keys/inspect") => {
@@ -848,8 +850,18 @@ fn internal_error(error: &anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
 /// A rejected share key is caller error, so report it as such instead of
 /// masking it behind a generic 500.
 fn invalid_key_error(error: anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
-    match crate::secret::invalid_key_error(&error) {
-        Some(invalid) => api_error(400, "invalid_key", invalid.message()),
+    caller_error_response(error)
+}
+
+/// Report a caller-supplied-input rejection with its own status and code.
+///
+/// Every validation failure that the caller can trigger — a malformed key, a
+/// folder path that is not a directory, two contradictory fields — carries a
+/// [`CallerError`], so the console gets a 4xx and a machine-readable code
+/// rather than an opaque 500. Anything else really is a server fault.
+fn caller_error_response(error: anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
+    match crate::caller_error::caller_error_from(&error) {
+        Some(caller) => api_error(caller.status(), caller.code(), caller.message()),
         None => internal_error(&error),
     }
 }
@@ -862,16 +874,13 @@ fn not_found_or_internal(error: anyhow::Error) -> Response<std::io::Cursor<Vec<u
     }
 }
 
-/// Folder mutations report a rejected share key as caller error (400) and
-/// keep 404 for a missing folder; everything else stays a 500.
+/// Folder mutations report rejected input as caller error and keep 404 for a
+/// missing folder; everything else stays a 500.
 fn folder_error(error: anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
     if error.to_string().contains("not found") {
         return api_error(404, "not_found", &error.to_string());
     }
-    match crate::secret::invalid_key_error(&error) {
-        Some(invalid) => api_error(400, "invalid_key", invalid.message()),
-        None => internal_error(&error),
-    }
+    caller_error_response(error)
 }
 
 fn client_ip(request: &Request) -> Option<SocketAddr> {
