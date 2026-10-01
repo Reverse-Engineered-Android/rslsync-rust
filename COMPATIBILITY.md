@@ -21,27 +21,37 @@ Upstream tunnel/merge/DirectTorrent traffic.
 | Concurrent edit/conflict | Compatible | Local value retained as `.Conflict`/`.ConflictN`; remote installed |
 | Periodic reconnect and rescan | Compatible | Dial and accept paths rerun scan/reconciliation per session |
 | Legacy TLS-PSK transport | Retained | Compatibility transport for older protocol paths |
+| Standard Folder `A/B` key family | Compatible | SHA-1 share identity and read-only enforcement |
+| Standard Folder `D/E/F` key family | Implemented | Key derivation, role links, and official content transform |
+| Encrypted-only `F` peers, both roles | Compatible | `F` dials and answers `D`/`E`; ciphertext name and bytes verified |
+| Read-only `E` relay to/from `F` | Compatible | `E` serves the writer's signed entry to `F`; `E` decrypts from an `F` responder |
+| Advanced Folder `G/H` | Out of scope | Explicitly rejected at parsing and API boundaries |
 
 The reproducible official matrix completed all of these cases against the
 upstream client 3.1.2 (build 1076):
 
 ```text
-create-multi-piece-both-directions
-update-multi-piece-both-directions
-delete-both-directions
-recreate-both-directions
-nested-directories-and-empty-files-both-directions
-official-to-Rust-file-metadata
-Rust-to-official-file-metadata
-rust-to-official-file-to-directory-change
-official-to-Rust-file-to-directory-change
+standard-A                        (standard folder, writable A key)
+encrypted-D                       (encrypted folder, writable D key)
+read-only-E                       (official D writes, Rust E reads)
+read-only-E-upstream              (Rust D writes, official E reads)
+encrypted-only-official-F-reads   (Rust D writes, official F stores ciphertext)
+encrypted-only-rust-F-reads       (official D writes, Rust F stores ciphertext)
+encrypted-only-rust-F-responder   (Rust F serves, official D writes)
+encrypted-only-official-F-responder (official F serves, Rust D reads)
+read-only-E-serves-official-F     (read-only E relays the writer's entry to F)
+read-only-E-reads-official-F      (read-only E decrypts from an F responder)
 ```
+
+Every case in this list is a hard gate in the default `--key-family all` run;
+the encrypted-only and read-only-relay cases are not opt-in.
 
 Run the matrix with `scripts/official_compat.py`, supplying a local official
 binary and an empty work directory. The script creates temporary roots and a
 writable A key, and fails if the official logs contain `unexpected packet`,
-`failed to verify signature`, `Invalid have_pieces info`, or
-`must be merge slave for get_root`.
+`failed to verify signature`, `Invalid have_pieces info`,
+`must be merge slave for get_root`, `failed to verify metadata hash`, or
+`bad signature`.
 
 ```bash
 python3 scripts/official_compat.py \
@@ -56,7 +66,22 @@ python3 scripts/official_compat.py \
 - A/D keys provide the Ed25519 signing material required to originate signed
   metadata and DirectTorrent logins.
 - B/E keys can authenticate and verify, but are not used to fabricate signed
-  A/D metadata.
+  A/D metadata. F keys are encrypted-only and cannot decrypt content.
+- A read-only `E` peer that relays a writer's content advertises the writer's
+  Ed25519 public key and forwards the writer's signed entry byte-for-byte; it
+  never fabricates a signature of its own. The relay identity is derived from
+  public key material only, so no read-only secret is required.
+- D derives E/F roles, E derives F, and D/E expose their derived keys through
+  REST/Web UI. Advanced Folder keys are rejected.
+- D/E/F piece nonces and AES-128 counter content transforms match the official
+  implementation and are covered by fixture tests.
+- The `epieces` field length is `16 + n*20 + (16 - (n*20 % 16))`; the padding
+  always adds a full block when the SHA-1 hashes fill whole AES blocks, which is
+  why the parser and `expected_torrent_info_size_for_shape` share
+  `encrypted_folder::encrypted_epieces_len`.
+- A read-only E peer interoperates with a writable official D peer: it receives
+  content, updates, nested directories, empty files, metadata and deletions, and
+  publishes nothing back (`read-only-E` case in `scripts/official_compat.py`).
 - DirectTorrent `proto v3` login is answered with the official 3.1.2
   length-prefixed `{data, meta}` body; `proto v2` login is echoed and continues
   with metadata/request/piece messages in uncompressed tunnel DATA frames.
@@ -95,6 +120,27 @@ the destination replacement.
 
 ## Current Limits
 
+- An encrypted-only `F` folder is read-only by construction: it holds no
+  content key, so it stores the ciphertext verbatim under the encrypted path
+  name and can never publish a plaintext object or sign metadata. It
+  interoperates in both roles — the SRPEH response carries the responder's own
+  role (`type=4` for an encrypted-only peer) and both sides derive the SRP
+  password from that declaration, so an `F` folder both dials and answers
+  `D`/`E` peers.
+- A read-only `E` node interoperates with an encrypted-only `F` peer in both
+  roles, verified against official client 3.1.2 build 1076:
+  * *Read-only `E` serving an `F` peer.* The node relays the writer's content:
+    a read-only share key carries no Ed25519 seed, so the node advertises the
+    **writer's** public key (`ed25519(D_body ‖ 0×12)`) and forwards the writer's
+    signed entry verbatim -- exactly what the official client does. A fresh
+    encrypted-only official `F` peer then pulls the ciphertext from the
+    read-only node alone and stores it under the encrypted path name
+    (`read-only-relay-serve` case in `scripts/official_compat.py`).
+  * *A read-only `E` node pulling from an official `F` folder.* The `F` peer
+    advertises `type=4` in its SRPEH response; the node derives the 20-byte
+    access key from that declaration and decrypts the ciphertext back to
+    plaintext (`read-only-relay-read` case in `scripts/official_compat.py`).
+  Both directions are hard gates in the default matrix, not opt-in.
 - The upstream compatibility path has no tracker, relay, NAT traversal, or
   multi-source piece repair. The repository's independent HTTP tracker layer
   (`src/tracker.rs`) is used for peer-candidate discovery by `SyncNode`; it is
@@ -104,7 +150,8 @@ the destination replacement.
   remote selection policy.
 - Encrypted folders are an independent AES-256-GCM vault format in
   `src/encrypted.rs`; key rotation and streaming chunk manifests are not part
-  of the v2 vault yet.
+  of the v2 vault yet. The upstream Standard Folder D/E/F transform is
+  implemented separately in `src/encrypted_folder.rs`.
 - POSIX mode/uid/gid metadata is captured and enforceable in the standalone
   manifest/vault APIs. The upstream wire metadata currently carries mode/mtime;
   ACLs and cross-host user-name mapping remain outside the compatibility path.

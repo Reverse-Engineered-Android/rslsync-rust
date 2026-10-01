@@ -358,6 +358,28 @@ button {
   font-size: 12px;
 }
 
+.folder-keys {
+  display: grid;
+  gap: 6px;
+  grid-column: 1 / -1;
+}
+
+.folder-key {
+  display: grid;
+  align-items: center;
+  gap: 10px;
+  grid-template-columns: 72px minmax(0, 1fr) 32px;
+  min-width: 0;
+}
+
+.folder-key code {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .row-actions {
   display: flex;
   flex-wrap: wrap;

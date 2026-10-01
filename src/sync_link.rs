@@ -8,12 +8,14 @@ pub enum SyncAccess {
     #[default]
     ReadWrite,
     ReadOnly,
+    EncryptedOnly,
 }
 
 impl SyncAccess {
     pub fn from_key(key: &ShareKey) -> Self {
         match key.key_type {
             'A' | 'D' => Self::ReadWrite,
+            'F' => Self::EncryptedOnly,
             _ => Self::ReadOnly,
         }
     }
@@ -22,6 +24,7 @@ impl SyncAccess {
         match self {
             Self::ReadWrite => "read-write",
             Self::ReadOnly => "read-only",
+            Self::EncryptedOnly => "encrypted-only",
         }
     }
 }
@@ -84,6 +87,7 @@ impl SyncLink {
                         access = match value {
                             "read-write" | "rw" => SyncAccess::ReadWrite,
                             "read-only" | "ro" => SyncAccess::ReadOnly,
+                            "encrypted-only" | "encrypted" => SyncAccess::EncryptedOnly,
                             other => bail!("unsupported sync link access {other}"),
                         };
                     }

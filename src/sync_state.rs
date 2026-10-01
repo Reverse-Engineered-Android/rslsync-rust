@@ -1,3 +1,4 @@
+use crate::bencode::{decode, encode};
 use crate::protocol::{EntryState, EntryType, FileMetadata};
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -29,12 +30,19 @@ pub struct StateRecord {
     pub sync_fingerprint: String,
     #[serde(default)]
     pub sync_metadata_hash: String,
+    #[serde(default)]
+    pub wire_main: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct SyncState {
     pub version: u8,
     pub entries: BTreeMap<String, StateRecord>,
+    /// The metadata signing key of the folder's writer, learned from a peer's
+    /// identity message and remembered so a read-only folder can still relay
+    /// the writer's entries after the writer goes offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_public_key: Option<String>,
 }
 
 pub struct SyncStateStore {
@@ -172,6 +180,10 @@ impl SyncStateStore {
             sync_file_hash,
             sync_fingerprint,
             sync_metadata_hash,
+            wire_main: metadata
+                .encrypted_main
+                .as_ref()
+                .map(|main| hex::encode(encode(main))),
         };
         self.state
             .entries
@@ -191,7 +203,7 @@ impl SyncStateStore {
             2 => EntryState::Deleted,
             _ => return None,
         };
-        Some(FileMetadata {
+        let mut metadata = FileMetadata {
             relative_path,
             entry_type,
             size: record.size,
@@ -207,7 +219,34 @@ impl SyncStateStore {
             otime: record.otime,
             write_times: record.write_times,
             signature: hex::decode(&record.signature).unwrap_or_default(),
-        })
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
+        };
+        if let Some(encoded) = &record.wire_main {
+            let bytes = hex::decode(encoded).ok()?;
+            let main = decode(&bytes).ok()?;
+            metadata.restore_encrypted_main(main).ok()?;
+        }
+        Some(metadata)
+    }
+
+    /// The writer identity this folder relays, when one has been observed.
+    pub fn writer_public_key(&self) -> Option<[u8; 32]> {
+        hex::decode(self.state.writer_public_key.as_deref()?)
+            .ok()?
+            .try_into()
+            .ok()
+    }
+
+    /// Remember the writer identity announced by a peer.
+    pub fn remember_writer_public_key(&mut self, public_key: &[u8; 32]) -> bool {
+        let encoded = hex::encode(public_key);
+        if self.state.writer_public_key.as_deref() == Some(encoded.as_str()) {
+            return false;
+        }
+        self.state.writer_public_key = Some(encoded);
+        true
     }
 
     pub fn local_fingerprint(&self, path: &str) -> Option<&str> {
@@ -277,6 +316,33 @@ mod tests {
         let restored = store.metadata("state.txt").unwrap();
         assert_eq!(restored.state, EntryState::Deleted);
         assert_eq!(restored.time_seconds, 1234);
+    }
+
+    #[test]
+    fn writer_public_key_round_trips_through_the_state_file() {
+        let root = tempdir().unwrap();
+        let mut store = SyncStateStore::load(root.path()).unwrap();
+        assert_eq!(store.writer_public_key(), None);
+
+        let key = [0x5a_u8; 32];
+        assert!(store.remember_writer_public_key(&key));
+        assert_eq!(store.writer_public_key(), Some(key));
+        // Re-remembering the same key is a no-op so callers can skip a save.
+        assert!(!store.remember_writer_public_key(&key));
+        store.save().unwrap();
+        drop(store);
+
+        let store = SyncStateStore::load(root.path()).unwrap();
+        assert_eq!(store.writer_public_key(), Some(key));
+        // The store holds an exclusive lock while open, so it must be released
+        // before the same state file is reopened.
+        drop(store);
+
+        // A different writer replaces the remembered one.
+        let mut store = SyncStateStore::load(root.path()).unwrap();
+        let replacement = [0x6b_u8; 32];
+        assert!(store.remember_writer_public_key(&replacement));
+        assert_eq!(store.writer_public_key(), Some(replacement));
     }
 
     #[test]

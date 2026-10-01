@@ -251,9 +251,11 @@ impl WebServer {
             }
             ("POST", "/api/v1/operations/keys/inspect") => {
                 self.authorized(request, |server, _, request| {
-                    server.json_endpoint(request, |body: InspectKeyRequest| {
-                        operations::inspect_key(body)
-                    })
+                    server.json_endpoint_with(
+                        request,
+                        |body: InspectKeyRequest| operations::inspect_key(body),
+                        invalid_key_error,
+                    )
                 })
             }
             ("POST", "/api/v1/operations/ping/encode") => {
@@ -308,8 +310,25 @@ impl WebServer {
         T: DeserializeOwned,
         R: Serialize,
     {
+        self.json_endpoint_with(request, operation, |error| internal_error(&error))
+    }
+
+    /// Like `json_endpoint`, but lets the caller classify operation failures.
+    fn json_endpoint_with<T, R>(
+        &self,
+        request: &mut Request,
+        operation: impl FnOnce(T) -> Result<R>,
+        on_error: fn(anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>>,
+    ) -> Response<std::io::Cursor<Vec<u8>>>
+    where
+        T: DeserializeOwned,
+        R: Serialize,
+    {
         match self.read_json(request) {
-            Ok(body) => json_result(operation(body)),
+            Ok(body) => match operation(body) {
+                Ok(value) => json_response(200, &value),
+                Err(error) => on_error(error),
+            },
             Err(response) => response,
         }
     }
@@ -568,28 +587,45 @@ impl WebServer {
         }
         peers.sort();
         peers.dedup();
-        if request.access == SyncAccess::ReadOnly {
-            if let Some(settings) = &folder.sync {
-                let read_only_key = ShareKey::parse(&settings.key)
-                    .and_then(|key| key.read_only_link_key())
-                    .unwrap_or_else(|_| ShareKey::generate_read_only());
-                let mut link_peers = settings.peers.clone();
-                link_peers.extend(peers);
-                link_peers.sort();
-                link_peers.dedup();
-                let link = crate::sync_link::SyncLink {
-                    key: read_only_key.render(),
-                    access: SyncAccess::ReadOnly,
-                    peers: link_peers,
-                    device_name: Some(settings.device_name.clone()),
+        if let Some(settings) = &folder.sync {
+            let current_key = ShareKey::parse(&settings.key);
+            let requested_key = current_key.and_then(|key| match request.access {
+                SyncAccess::ReadWrite if key.is_read_write() => Ok(key),
+                SyncAccess::ReadOnly => key.read_only_link_key(),
+                SyncAccess::EncryptedOnly => key.encrypted_link_key(),
+                SyncAccess::ReadWrite => anyhow::bail!(
+                    "{} share keys cannot be changed to read-write access",
+                    key.key_type
+                ),
+            });
+            return match requested_key {
+                Ok(key) => {
+                    let mut link_peers = settings.peers.clone();
+                    link_peers.extend(peers);
+                    link_peers.sort();
+                    link_peers.dedup();
+                    let link = crate::sync_link::SyncLink {
+                        key: key.render(),
+                        access: SyncAccess::from_key(&key),
+                        peers: link_peers,
+                        device_name: Some(settings.device_name.clone()),
+                    }
+                    .render();
+                    folder_response_with_link(Ok(folder), Some(link))
                 }
-                .render();
-                return folder_response_with_link(Ok(folder), Some(link));
-            }
+                Err(error) => api_error(400, "invalid_share_key", &error.to_string()),
+            };
         }
         let key = match request.access {
             SyncAccess::ReadWrite => ShareKey::generate_read_write(),
             SyncAccess::ReadOnly => ShareKey::generate_read_only(),
+            SyncAccess::EncryptedOnly => {
+                return api_error(
+                    400,
+                    "invalid_share_key",
+                    "encrypted-only folders cannot be generated without a D or E key",
+                )
+            }
         };
         let settings_request = FolderSyncRequest {
             key: Some(key.render()),
@@ -713,7 +749,7 @@ fn folder_response_with_link(
             value["folder"] = folder_value;
             json_response(200, &value)
         }
-        Err(error) => not_found_or_internal(error),
+        Err(error) => folder_error(error),
     }
 }
 
@@ -739,6 +775,7 @@ fn public_sync_settings(settings: &SyncSettings) -> serde_json::Value {
         "access": settings.access,
         "key_type": metadata.as_ref().map(|key| key.key_type),
         "share_id": metadata.as_ref().map(|key| hex::encode(key.share_id())),
+        "keys": metadata.as_ref().map(|key| key.derived_keys()),
         "peers": settings.peers,
         "auto_sync": settings.auto_sync,
         "sync_interval_seconds": settings.sync_interval_seconds,
@@ -754,13 +791,6 @@ fn render_folder_link(settings: &SyncSettings) -> String {
         device_name: Some(settings.device_name.clone()),
     }
     .render()
-}
-
-fn json_result<T: Serialize>(result: Result<T>) -> Response<std::io::Cursor<Vec<u8>>> {
-    match result {
-        Ok(value) => json_response(200, &value),
-        Err(error) => not_found_or_internal(error),
-    }
 }
 
 fn static_asset(path: &str) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -815,11 +845,32 @@ fn internal_error(error: &anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
     api_error(500, "internal_error", "internal server error")
 }
 
+/// A rejected share key is caller error, so report it as such instead of
+/// masking it behind a generic 500.
+fn invalid_key_error(error: anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
+    match crate::secret::invalid_key_error(&error) {
+        Some(invalid) => api_error(400, "invalid_key", invalid.message()),
+        None => internal_error(&error),
+    }
+}
+
 fn not_found_or_internal(error: anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
     if error.to_string().contains("not found") {
         api_error(404, "not_found", &error.to_string())
     } else {
         internal_error(&error)
+    }
+}
+
+/// Folder mutations report a rejected share key as caller error (400) and
+/// keep 404 for a missing folder; everything else stays a 500.
+fn folder_error(error: anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
+    if error.to_string().contains("not found") {
+        return api_error(404, "not_found", &error.to_string());
+    }
+    match crate::secret::invalid_key_error(&error) {
+        Some(invalid) => api_error(400, "invalid_key", invalid.message()),
+        None => internal_error(&error),
     }
 }
 

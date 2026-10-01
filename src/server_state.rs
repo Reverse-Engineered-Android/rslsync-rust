@@ -539,6 +539,9 @@ fn build_sync_settings_with_base(
                     let key = match access {
                         SyncAccess::ReadWrite => ShareKey::generate_read_write(),
                         SyncAccess::ReadOnly => ShareKey::generate_read_only(),
+                        SyncAccess::EncryptedOnly => {
+                            bail!("encrypted-only folders cannot be generated without a D or E key")
+                        }
                     };
                     (access, key)
                 }

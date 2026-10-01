@@ -66,11 +66,20 @@ enum Command {
         #[arg(long, default_value = "preserve")]
         permissions: String,
     },
-    /// Generate an upstream-compatible B/read-only or A/read-write share key.
+    /// Generate an upstream-compatible Standard or encrypt-capable share key.
     GenerateKey {
-        /// Generate a writable A key instead of a read-only B key.
+        /// Generate a writable key instead of a read-only B key.
         #[arg(long)]
         read_write: bool,
+        /// Select `standard` or `encrypt-capable`; writable defaults to D.
+        #[arg(long)]
+        key_family: Option<String>,
+        /// Derive a linked role from this existing key instead of generating one.
+        #[arg(long)]
+        from: Option<String>,
+        /// Role to derive from `--from`: `read-write`, `read-only`, or `encrypted`.
+        #[arg(long)]
+        derive: Option<String>,
     },
     /// Validate an upstream key and print non-secret compatibility metadata.
     InspectKey { key: String },
@@ -243,13 +252,20 @@ fn main() -> Result<()> {
             )?;
             println!("{} {}", manifest.root_hash, target.display());
         }
-        Command::GenerateKey { read_write } => {
-            let key = if read_write {
-                ShareKey::generate_read_write()
-            } else {
-                ShareKey::generate_read_only()
-            };
-            println!("{}", key.render());
+        Command::GenerateKey {
+            read_write,
+            key_family,
+            from,
+            derive,
+        } => {
+            let response =
+                rustsync::operations::generate_key(rustsync::operations::GenerateKeyRequest {
+                    read_write,
+                    key_family,
+                    from,
+                    derive,
+                })?;
+            println!("{}", response.key);
         }
         Command::InspectKey { key } => {
             let parsed = ShareKey::parse(&key)?;
@@ -461,11 +477,21 @@ fn run_remote(client: &mut RemoteClient, command: Command) -> Result<()> {
             )?;
             println!("{} {}", response.root_hash, response.target.display());
         }
-        Command::GenerateKey { read_write } => {
+        Command::GenerateKey {
+            read_write,
+            key_family,
+            from,
+            derive,
+        } => {
             let response: rustsync::operations::GenerateKeyResponse = client.call(
                 "POST",
                 "/api/v1/operations/keys/generate",
-                Some(&GenerateKeyRequest { read_write }),
+                Some(&GenerateKeyRequest {
+                    read_write,
+                    key_family,
+                    from,
+                    derive,
+                }),
             )?;
             println!("{}", response.key);
         }

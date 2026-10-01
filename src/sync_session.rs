@@ -1,11 +1,12 @@
 use crate::acl::{empty_hash, parse_entries, AclState};
 use crate::bencode::{decode, decode_prefix_wire, encode, Value};
 use crate::discovery::spawn_advertiser;
+use crate::encrypted_folder;
 use crate::protocol::{
     acl_entries_accepted_message, acl_entries_message, acl_nodes_message, build_file_tree,
-    decode_direct_torrent, expected_torrent_info_size, get_acl_entries_message,
-    get_acl_nodes_message, parse_content, parse_file, parse_torrent_info, read_bencode_frame,
-    read_tunnel_frame, read_wire_payload_bytes, write_bencode_frame,
+    decode_direct_torrent, expected_torrent_info_size_for_shape, get_acl_entries_message,
+    get_acl_nodes_message, parse_content, parse_file_with_key, parse_torrent_info,
+    read_bencode_frame, read_tunnel_frame, read_wire_payload_bytes, write_bencode_frame,
     write_bencode_frame_uncompressed, write_tunnel_frame, EntryState, EntryType, FileMetadata,
     FileTree, PeerIdentity, TorrentMetadata, WirePayload, DIRECT_TORRENT_MAGIC_V2,
     DIRECT_TORRENT_MAGIC_V3, PIECE_LENGTH, TUNNEL_EOF_AT_FRAME_BOUNDARY, TUNNEL_PACKET_ACK,
@@ -19,7 +20,7 @@ use crate::sync_state::{local_fingerprint, StateRecord, SyncStateStore};
 use crate::tls::{accept_psk, connect_psk};
 use crate::tracker::{TrackerClient, TrackerPeer, TrackerRequest};
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -64,7 +65,12 @@ struct DownloadSession {
 #[derive(Debug)]
 struct UploadSession {
     metadata: FileMetadata,
+    /// Bytes served over the piece protocol, i.e. what the receiver stores.
     content: Vec<u8>,
+    /// Ciphertext form of the same content. The torrent info published through
+    /// `ut_metadata` must describe these bytes, because `file_hash` was derived
+    /// from them; a receiver rejects a metadata blob whose hash differs.
+    torrent_content: Vec<u8>,
     remote_metadata_id: Option<u8>,
 }
 
@@ -279,12 +285,21 @@ impl SyncNode {
         if !root.is_dir() {
             bail!("sync root is not a directory: {}", root.display());
         }
-        let identity = PeerIdentity::from_key(device_name, &key, peer_id)?;
-        let read_only = matches!(key.key_type, 'B' | 'E');
+        let read_only = matches!(key.key_type, 'B' | 'E' | 'F');
+        // A read-only share key carries no Ed25519 seed, but the official
+        // read-only peer still advertises a real `pk` and signs the entries it
+        // relays with it; the receiver verifies against that advertised key.
+        // Advertising the zero key instead makes every relayed entry look like
+        // `bad signature` to the receiving peer, so such a node keeps one
+        // generated identity beside its sync state and reuses it across runs.
         let signing_key = key
             .ed25519_signing_key()
-            .unwrap_or_else(|_| SigningKey::from_bytes(&rand::random()));
-        let metadata_public_key = key.ed25519_public_key().ok();
+            .unwrap_or_else(|_| persistent_identity_key(&root));
+        let public_key = key
+            .ed25519_public_key()
+            .unwrap_or_else(|_| signing_key.verifying_key().to_bytes());
+        let identity = PeerIdentity::from_keys(device_name, key.share_id(), public_key, peer_id);
+        let metadata_public_key = Some(public_key);
         Ok(Self {
             root,
             key,
@@ -321,6 +336,177 @@ impl SyncNode {
 
     pub fn acl_state(&self) -> &AclState {
         &self.acl
+    }
+
+    /// The bytes served to a peer for one file.
+    ///
+    /// Inside an encrypted folder the wire carries AES-transformed content
+    /// while the torrent advertises the *plaintext* piece hashes; the receiver
+    /// decrypts these bytes and compares them against those hashes. Serving the
+    /// plaintext here is what made an encrypted-only peer reject the download
+    /// (its piece hash check failed) even though the metadata verified.
+    fn wire_content(
+        &self,
+        metadata: &FileMetadata,
+        content: &[u8],
+        encrypted_wire: bool,
+    ) -> Result<Vec<u8>> {
+        if !encrypted_wire || content.is_empty() || !self.key.can_encrypt() {
+            return Ok(content.to_vec());
+        }
+        crate::encrypted_folder::encrypt_content(
+            &self.key.encryption_key()?,
+            &metadata.piece_hashes,
+            PIECE_LENGTH as usize,
+            content,
+        )
+    }
+
+    fn sign_metadata(&self, metadata: &mut FileMetadata) -> Result<()> {
+        // A read-only folder relays the writer's signed entries and announces
+        // the writer's public key, so it must not overwrite that signature with
+        // its own; only entries it originates itself need signing. Such a node
+        // rebuilds its entries from the stored canonical form, which is what
+        // makes the writer's signature still cover them.
+        if self.read_only && !metadata.signature.is_empty() {
+            return Ok(());
+        }
+        if self.key.can_encrypt()
+            && metadata.entry_type == EntryType::RegularFile
+            && metadata.state == EntryState::Active
+            && metadata.size > 0
+        {
+            let content = fs::read(self.root.join(metadata.wire_path_string()))
+                .with_context(|| format!("read {}", metadata.wire_path_string()))?;
+            metadata.prepare_encrypted_with_content(&self.key, &content)?;
+        } else {
+            metadata.prepare_encrypted(&self.key)?;
+        }
+        metadata.sign(&self.signing_key)
+    }
+
+    /// Verify the `data` field of one file and return the bytes to store.
+    ///
+    /// Inside an encrypted folder the wire carries ciphertext, so upstream
+    /// hashes those bytes into `pieces` and ships the AES-wrapped SHA-1 of the
+    /// plaintext in `epieces`. Both layers are checked: the ciphertext against
+    /// `pieces`, then the decrypted bytes against `epieces`. The decrypted
+    /// plaintext is what gets written to disk for a `D`/`E` folder; an
+    /// encrypted-only (`F`) session has no content key and stores the
+    /// ciphertext verbatim.
+    /// Verify the `data` field of one file and return the bytes to store.
+    ///
+    /// `pieces` always describes the ciphertext of an encrypted folder, but the
+    /// `data` body depends on the receiver: official client 3.1.2 sends the
+    /// plaintext to a peer holding a content key and the ciphertext only to an
+    /// encrypted-only peer. Both bodies are therefore accepted here — the
+    /// ciphertext is checked against `pieces`, the plaintext against the
+    /// AES-wrapped hashes in `epieces` — and the plaintext is returned whenever
+    /// this session can derive it, so a `D`/`E` folder keeps decrypting what an
+    /// `E` peer published.
+    fn verified_content(
+        &self,
+        metadata: &FileMetadata,
+        torrent: &crate::protocol::TorrentMetadata,
+        wire_content: &[u8],
+    ) -> Result<Vec<u8>> {
+        // A plain folder, and an encrypted-only session that holds no content
+        // key, both receive exactly the bytes `pieces` describes and store them
+        // unchanged (`F` keeps the ciphertext).
+        if metadata.encrypted_epart.is_none()
+            || torrent.epieces.is_empty()
+            || !self.key.can_encrypt()
+        {
+            torrent.verify(wire_content).with_context(|| {
+                format!(
+                    "verify received content for {}",
+                    metadata.protocol_path_string()
+                )
+            })?;
+            return Ok(wire_content.to_vec());
+        }
+        let content_key = self.key.encryption_key()?;
+        let plaintext_hashes = encrypted_folder::decrypt_epieces(&content_key, &torrent.epieces)
+            .context("decrypt encrypted torrent piece hashes")?;
+        if plaintext_hashes.len() != torrent.piece_hashes.len() {
+            bail!("encrypted torrent piece hash count mismatch");
+        }
+        let mut plaintext_torrent = torrent.clone();
+        plaintext_torrent.piece_hashes = plaintext_hashes.clone();
+        if plaintext_torrent.verify(wire_content).is_ok() {
+            return Ok(wire_content.to_vec());
+        }
+        torrent.verify(wire_content).with_context(|| {
+            format!(
+                "verify received encrypted content for {}",
+                metadata.protocol_path_string()
+            )
+        })?;
+        let mut decrypted = wire_content.to_vec();
+        encrypted_folder::decrypt_content(
+            &content_key,
+            &plaintext_hashes,
+            torrent.piece_length as usize,
+            &mut decrypted,
+        )
+        .context("decrypt received encrypted content")?;
+        plaintext_torrent.verify(&decrypted).with_context(|| {
+            format!(
+                "verify received plaintext content for {}",
+                metadata.protocol_path_string()
+            )
+        })?;
+        Ok(decrypted)
+    }
+
+    fn metadata_content_key(&self, metadata: &FileMetadata) -> Result<Option<[u8; 16]>> {
+        if metadata.encrypted_epart.is_some() {
+            Ok(Some(self.key.encryption_key()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn direct_info_hash_matches(
+        &self,
+        metadata: &FileMetadata,
+        expected: &[u8; 20],
+        encrypted_wire: bool,
+    ) -> Result<bool> {
+        if metadata.info_hash_for_wire(&self.identity.share_id, encrypted_wire) == *expected {
+            return Ok(true);
+        }
+        if encrypted_wire || !self.key.can_encrypt() {
+            return Ok(false);
+        }
+        let mut encrypted_metadata = metadata.clone();
+        encrypted_metadata.prepare_encrypted(&self.key)?;
+        Ok(encrypted_metadata.info_hash_for_wire(&self.identity.share_id, true) == *expected)
+    }
+
+    fn direct_request_signature_matches(
+        &self,
+        signature: &[u8],
+        info_hash: &[u8; 20],
+        relative_path: &str,
+        local_metadata: &FileMetadata,
+        remote_files: &HashMap<String, FileMetadata>,
+    ) -> Result<bool> {
+        if signature == local_metadata.signature_for_wire(&self.signing_key)? {
+            return Ok(true);
+        }
+
+        Ok(remote_files.values().any(|remote_metadata| {
+            let encrypted_wire = remote_metadata.protocol_path_string() == relative_path;
+            if !encrypted_wire && remote_metadata.wire_path_string() != relative_path {
+                return false;
+            }
+            if remote_metadata.signature.is_empty() || remote_metadata.signature != signature {
+                return false;
+            }
+            self.direct_info_hash_matches(remote_metadata, info_hash, encrypted_wire)
+                .unwrap_or(false)
+        }))
     }
 
     pub fn announce_to_trackers(&self, port: u16, event: Option<&str>) -> Result<Vec<TrackerPeer>> {
@@ -442,9 +628,10 @@ impl SyncNode {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         if preface[0] == srpeh::SRPEH_MAGIC[0] {
             let material = srpeh::server_handshake_material(&mut stream, &self.key)?;
+            let peer_encrypted_only = material.peer_is_encrypted_only();
             stream.set_read_timeout(Some(Duration::from_millis(100)))?;
             let mut stream = material.server_stream(stream);
-            return self.run_connection(&mut stream, false);
+            return self.run_connection(&mut stream, false, peer_encrypted_only);
         }
         if preface[0] != 0x16 {
             exchange_tunnel_check(&mut stream.try_clone()?, self.identity.peer_id, false)?;
@@ -455,9 +642,10 @@ impl SyncNode {
             }
             if preface[0] == srpeh::SRPEH_MAGIC[0] {
                 let material = srpeh::server_handshake_material(&mut stream, &self.key)?;
+                let peer_encrypted_only = material.peer_is_encrypted_only();
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                 let mut stream = material.server_stream(stream);
-                return self.run_connection(&mut stream, false);
+                return self.run_connection(&mut stream, false, peer_encrypted_only);
             }
             if preface[0] != 0x16 {
                 bail!("unknown encrypted tunnel preface 0x{:02x}", preface[0]);
@@ -467,7 +655,7 @@ impl SyncNode {
         stream
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(100)))?;
-        self.run_connection(&mut stream, false)
+        self.run_connection(&mut stream, false, false)
     }
 
     pub fn connect(&self, address: &str) -> Result<()> {
@@ -502,7 +690,7 @@ impl SyncNode {
         stream
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(100)))?;
-        self.run_connection(&mut stream, true)
+        self.run_connection(&mut stream, true, false)
     }
 
     pub fn connect_srpeh_once(&self, address: &str) -> Result<()> {
@@ -510,14 +698,30 @@ impl SyncNode {
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         let material = srpeh::client_handshake_material(&mut stream, &self.key)?;
+        // The responder announces its own role in the SRPEH reply. An
+        // encrypted-only responder has no content key, so it can only consume
+        // the ciphertext body and must be addressed as encrypted-only even when
+        // we ourselves hold the writable key.
+        let peer_encrypted_only = material.peer_is_encrypted_only();
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         let mut stream = material.client_stream(stream);
-        self.run_connection(&mut stream, true)
+        self.run_connection(&mut stream, true, peer_encrypted_only)
     }
 
-    fn start_merge_session<S: Read + Write>(&self, mux: &mut TunnelMux<'_, S>) -> Result<u32> {
+    fn start_merge_session<S: Read + Write>(
+        &self,
+        mux: &mut TunnelMux<'_, S>,
+        relay_identity: Option<[u8; 32]>,
+    ) -> Result<u32> {
         let connection_id = mux.open_session()?;
-        write_peer_message_uncompressed(mux, connection_id, &self.identity.id_message())?;
+        // While relaying, announce the writer's public key instead of this
+        // node's own: the peer was handed the writer's signed entries and
+        // verifies them against exactly that key.
+        let identity = match relay_identity {
+            Some(public_key) => self.identity.id_message_with_key(public_key),
+            None => self.identity.id_message(),
+        };
+        write_peer_message_uncompressed(mux, connection_id, &identity)?;
         Ok(connection_id)
     }
 
@@ -535,19 +739,43 @@ impl SyncNode {
         )
     }
 
-    pub fn run_connection<S: Read + Write>(&self, stream: &mut S, initiator: bool) -> Result<()> {
+    /// `peer_encrypted_only` marks a peer that declared the encrypted share
+    /// type during the handshake. Such a peer holds no Ed25519 key and cannot
+    /// decrypt, so every file published to it must use the encrypted wire form.
+    pub fn run_connection<S: Read + Write>(
+        &self,
+        stream: &mut S,
+        initiator: bool,
+        peer_encrypted_only: bool,
+    ) -> Result<()> {
         let mut sync_state = SyncStateStore::load(&self.root)?;
         let mut local_files = self.scan_files(&mut sync_state)?;
-        let mut published_files = if self.read_only {
-            Vec::new()
+        // A read-only folder relays the writer's own signed entries to an
+        // encrypted-only peer, which cannot write or decrypt and so can never
+        // turn the relay into a divergent tree. That identity is learned from
+        // the peer's `id` message and remembered in the sync state.
+        let mut relay_identity = if self.read_only && peer_encrypted_only {
+            sync_state.writer_public_key()
         } else {
-            local_files.clone()
+            None
         };
-        let mut local_tree = build_tree(&published_files)?;
+        let mut published_files = match relay_identity {
+            Some(_) => relay_files(&self.root, &sync_state),
+            None => {
+                if self.read_only {
+                    Vec::new()
+                } else {
+                    local_files.clone()
+                }
+            }
+        };
+        let mut local_tree = build_tree(&published_files, false)?;
         let mut root_hash = local_tree.root_hash;
         let mut local_paths = top_level_paths(&published_files);
         let mut remote_paths = BTreeSet::new();
         let mut remote_files: HashMap<String, FileMetadata> = HashMap::new();
+        let mut remote_roots: HashMap<u32, [u8; 20]> = HashMap::new();
+        let mut pending_have_pieces: HashSet<u32> = HashSet::new();
         let mut remote_public_keys: HashMap<u32, [u8; 32]> = HashMap::new();
         let mut remote_public_key: Option<[u8; 32]> = None;
         let mut downloads: HashMap<u32, DownloadSession> = HashMap::new();
@@ -581,7 +809,14 @@ impl SyncNode {
         let own_merge_connection = establish_tunnel(&mut mux, initiator)?;
         let mut merge_connection = own_merge_connection;
         merge_connections.insert(merge_connection);
-        write_peer_message_uncompressed(&mut mux, merge_connection, &self.identity.id_message())?;
+        // While relaying, this connection must also announce the writer's key:
+        // the peer verifies the relayed entries against whatever `pk` arrived
+        // last, so sending our own key here would undo the relay identity.
+        let announced = match relay_identity {
+            Some(public_key) => self.identity.id_message_with_key(public_key),
+            None => self.identity.id_message(),
+        };
+        write_peer_message_uncompressed(&mut mux, merge_connection, &announced)?;
 
         loop {
             if let Some(deadline) = merge_root_deadline {
@@ -600,7 +835,7 @@ impl SyncNode {
             {
                 merge_request_at = None;
                 if !mux.known.contains(&merge_connection) {
-                    merge_connection = self.start_merge_session(&mut mux)?;
+                    merge_connection = self.start_merge_session(&mut mux, relay_identity)?;
                 }
                 sent_get_nodes = false;
                 sent_file_manifest = false;
@@ -630,12 +865,17 @@ impl SyncNode {
             }
             if Instant::now() >= next_local_scan {
                 let refreshed_files = self.scan_files(&mut sync_state)?;
-                let refreshed_published_files = if self.read_only {
-                    Vec::new()
-                } else {
-                    refreshed_files.clone()
+                let refreshed_published_files = match relay_identity {
+                    Some(_) => relay_files(&self.root, &sync_state),
+                    None => {
+                        if self.read_only {
+                            Vec::new()
+                        } else {
+                            refreshed_files.clone()
+                        }
+                    }
                 };
-                let refreshed_tree = build_tree(&refreshed_published_files)?;
+                let refreshed_tree = build_tree(&refreshed_published_files, false)?;
                 let refreshed_root = refreshed_tree.root_hash;
                 let refreshed_paths = top_level_paths(&refreshed_published_files);
                 if refreshed_root != root_hash {
@@ -774,14 +1014,6 @@ impl SyncNode {
                         mux.send_data(packet.connection_id, &magic)?;
                     }
                     WirePayload::Direct(frame) => {
-                        trace_sync(
-                            "direct-ident",
-                            &format!(
-                                "conn={} magic={}",
-                                packet.connection_id,
-                                hex::encode(frame.get(..20).unwrap_or_default())
-                            ),
-                        );
                         let direct_message = decode_direct_torrent(&frame)?;
                         if direct_message.as_dict()?.contains_key(&b"data"[..]) {
                             self.apply_content_response(
@@ -867,10 +1099,12 @@ impl SyncNode {
                             .context("PeerMessage has no type")?;
                         match message_type {
                             b"id" => {
-                                let public_key =
-                                    message.get(b"pk")?.as_bytes()?.try_into().map_err(|_| {
-                                        anyhow::anyhow!("peer identity key is not 32 bytes")
-                                    })?;
+                                // A read-only peer holds no Ed25519 key, so the
+                                // official client omits `pk` entirely. Keep the
+                                // connection and record the same "cannot sign"
+                                // sentinel the rest of the code already uses for
+                                // a peer that has no metadata signing identity.
+                                let public_key = crate::protocol::peer_identity_key(&message)?;
                                 let remote_share_id: [u8; 20] =
                                     message.get(b"share")?.as_bytes()?.try_into().map_err(
                                         |_| anyhow::anyhow!("peer share ID is not 20 bytes"),
@@ -878,17 +1112,35 @@ impl SyncNode {
                                 if remote_share_id != self.identity.share_id {
                                     bail!("peer share ID does not match the configured share");
                                 }
-                                trace_sync(
-                                    "id",
-                                    &format!(
-                                        "conn={} pk={} share={}",
-                                        packet.connection_id,
-                                        hex::encode(public_key),
-                                        hex::encode(remote_share_id)
-                                    ),
-                                );
                                 remote_public_keys.insert(packet.connection_id, public_key);
-                                remote_public_key = Some(public_key);
+                                // A signing-capable peer supersedes the sentinel;
+                                // never overwrite a real key with a zero one.
+                                if !crate::protocol::peer_key_cannot_sign(&public_key)
+                                    || remote_public_key.is_none()
+                                {
+                                    remote_public_key = Some(public_key);
+                                }
+                                // A read-only folder answers a later
+                                // encrypted-only peer with the writer's own
+                                // identity, so remember it as soon as a signing
+                                // peer announces one.
+                                if self.read_only
+                                    && !crate::protocol::peer_key_cannot_sign(&public_key)
+                                    && sync_state.remember_writer_public_key(&public_key)
+                                {
+                                    sync_state.save()?;
+                                    relay_identity = Some(public_key);
+                                    published_files = relay_files(&self.root, &sync_state);
+                                    local_tree = build_tree(&published_files, false)?;
+                                    root_hash = local_tree.root_hash;
+                                    local_paths = top_level_paths(&published_files);
+                                    sent_file_manifest = false;
+                                    requested_get_files.clear();
+                                    if mux.known.contains(&merge_connection) {
+                                        mux.send_close(merge_connection)?;
+                                    }
+                                    merge_request_at = Some(Instant::now());
+                                }
                                 merge_connections.insert(packet.connection_id);
                             }
                             b"get_root" => {
@@ -935,6 +1187,7 @@ impl SyncNode {
                                     .and_then(|value| value.as_bytes().ok())
                                     .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
                                     .unwrap_or(root_hash);
+                                remote_roots.insert(packet.connection_id, remote_root);
                                 let remote_acl_hash = message
                                     .get(b"acl_hash")
                                     .ok()
@@ -952,6 +1205,7 @@ impl SyncNode {
                                     sent_file_manifest = false;
                                     requested_get_files.clear();
                                     reconciled_versions.clear();
+                                    remote_files.clear();
                                     send_get_nodes(
                                         &mut mux,
                                         packet.connection_id,
@@ -1046,18 +1300,6 @@ impl SyncNode {
                             }
                             b"nodes" => {
                                 let discovered_paths = node_top_level_paths(&message)?;
-                                trace_sync(
-                                    "nodes",
-                                    &format!(
-                                        "conn={} sent_manifest={} requested={:?} local={:?} discovered={:?} remote={:?}",
-                                        packet.connection_id,
-                                        sent_file_manifest,
-                                        requested_get_files,
-                                        local_paths,
-                                        discovered_paths,
-                                        remote_paths,
-                                    ),
-                                );
                                 if packet.connection_id != merge_connection
                                     || !merge_connections.contains(&packet.connection_id)
                                 {
@@ -1075,15 +1317,12 @@ impl SyncNode {
                                         packet.connection_id,
                                         &published_files,
                                         &[],
+                                        self.wire_is_encrypted(
+                                            remote_public_keys.get(&packet.connection_id),
+                                            peer_encrypted_only,
+                                        ),
                                     )?;
                                     if requested_get_files != desired_paths {
-                                        trace_sync(
-                                    "request_files",
-                                    &format!(
-                                        "conn={} desired={desired_paths:?} requested={requested_get_files:?}",
-                                        packet.connection_id
-                                    ),
-                                );
                                         send_get_files(
                                             &mut mux,
                                             packet.connection_id,
@@ -1091,58 +1330,78 @@ impl SyncNode {
                                         )?;
                                         requested_get_files = desired_paths;
                                     }
-                                    write_peer_message(
-                                        &mut mux,
-                                        packet.connection_id,
-                                        &have_pieces_message(root_hash, &published_files),
-                                    )?;
+                                    pending_have_pieces.insert(packet.connection_id);
                                     sent_file_manifest = true;
                                     sent_get_root = false;
                                 }
                             }
                             b"get_files" | b"get_files_next" => {
                                 let paths = requested_paths(&message)?;
-                                trace_sync(
-                                    "get_files",
-                                    &format!("conn={} paths={paths:?}", packet.connection_id),
-                                );
                                 self.send_files(
                                     &mut mux,
                                     packet.connection_id,
                                     &local_files,
                                     &paths,
+                                    self.wire_is_encrypted(
+                                        remote_public_keys.get(&packet.connection_id),
+                                        peer_encrypted_only,
+                                    ),
                                 )?;
                             }
                             b"files" => {
-                                trace_sync("files", &format!("conn={}", packet.connection_id));
                                 if !merge_connections.contains(&packet.connection_id) {
                                     continue;
                                 }
                                 merge_connection = packet.connection_id;
                                 let list = message.get(b"files")?.as_list()?;
                                 let mut refreshed_remote_files = HashMap::new();
+                                // A read-only peer cannot sign, so fall back to
+                                // our own key (the writer's) to verify metadata,
+                                // exactly as the local-key path already does.
                                 let metadata_public_key = remote_public_keys
                                     .get(&packet.connection_id)
                                     .copied()
-                                    .or(remote_public_key)
+                                    .filter(|public_key| {
+                                        !crate::protocol::peer_key_cannot_sign(public_key)
+                                    })
+                                    .or(remote_public_key
+                                        .filter(|key| !crate::protocol::peer_key_cannot_sign(key)))
                                     .or(self.metadata_public_key)
                                     .context("peer sent file metadata before its identity")?;
-                                trace_sync(
-                                    "files",
-                                    &format!(
-                                        "conn={} remote_key={}",
-                                        packet.connection_id,
-                                        hex::encode(metadata_public_key)
-                                    ),
-                                );
                                 for value in list {
-                                    let metadata = parse_file(value, &metadata_public_key)?;
+                                    let metadata = parse_file_with_key(
+                                        value,
+                                        &metadata_public_key,
+                                        Some(&self.key),
+                                    )?;
                                     let path = metadata.wire_path_string();
                                     if self.selection.allows_path(&path) {
                                         refreshed_remote_files.insert(path, metadata);
                                     }
                                 }
-                                remote_files = refreshed_remote_files;
+                                remote_files.extend(refreshed_remote_files);
+                                if pending_have_pieces.remove(&packet.connection_id) {
+                                    if let Some(remote_root) =
+                                        remote_roots.get(&packet.connection_id).copied()
+                                    {
+                                        match peer_have_pieces_message(
+                                            remote_root,
+                                            &remote_files,
+                                            &published_files,
+                                        ) {
+                                            Ok(message) => write_peer_message(
+                                                &mut mux,
+                                                packet.connection_id,
+                                                &message,
+                                            )?,
+                                            Err(_) => {
+                                                pending_have_pieces.insert(packet.connection_id);
+                                            }
+                                        }
+                                    } else {
+                                        pending_have_pieces.insert(packet.connection_id);
+                                    }
+                                }
                                 for (path, metadata) in &remote_files {
                                     let metadata_hash = metadata.metadata_hash();
                                     if reconciled_versions.get(path) == Some(&metadata_hash) {
@@ -1171,7 +1430,7 @@ impl SyncNode {
                                         {
                                             let mut tombstone =
                                                 entry.metadata.tombstone(unix_time());
-                                            tombstone.sign(&self.signing_key)?;
+                                            self.sign_metadata(&mut tombstone)?;
                                             entry.metadata = tombstone;
                                             entry.content.clear();
                                         } else if entry.metadata.state == EntryState::Deleted
@@ -1199,7 +1458,7 @@ impl SyncNode {
                                             };
                                             entry.metadata = metadata;
                                             entry.content = content;
-                                            entry.metadata.sign(&self.signing_key)?;
+                                            self.sign_metadata(&mut entry.metadata)?;
                                         }
                                     }
                                     reconciled_versions.insert(path.clone(), metadata_hash);
@@ -1312,10 +1571,18 @@ impl SyncNode {
                                         continue;
                                     }
                                     let connection_id = mux.open_session()?;
+                                    // Request the name the responder can
+                                    // actually look up: only an
+                                    // encrypted-only peer holds the encrypted
+                                    // tree, every other peer publishes the
+                                    // plaintext one.
                                     let login = metadata.direct_login(
                                         &self.identity.share_id,
                                         &self.identity.peer_id,
                                         &self.signing_key,
+                                        metadata.encrypted_epart.is_some()
+                                            || self.key.is_encrypted_only(),
+                                        peer_encrypted_only,
                                     )?;
                                     mux.send_data(connection_id, &login)?;
                                     downloads.insert(
@@ -1337,11 +1604,25 @@ impl SyncNode {
                                 }
                             }
                             b"get_have_pieces" => {
-                                write_peer_message(
-                                    &mut mux,
-                                    packet.connection_id,
-                                    &have_pieces_message(root_hash, &published_files),
-                                )?;
+                                let remote_root = remote_roots
+                                    .get(&packet.connection_id)
+                                    .copied()
+                                    .unwrap_or(root_hash);
+                                if remote_root == root_hash {
+                                    write_peer_message(
+                                        &mut mux,
+                                        packet.connection_id,
+                                        &have_pieces_message(root_hash, &published_files),
+                                    )?;
+                                } else if let Ok(message) = peer_have_pieces_message(
+                                    remote_root,
+                                    &remote_files,
+                                    &published_files,
+                                ) {
+                                    write_peer_message(&mut mux, packet.connection_id, &message)?;
+                                } else {
+                                    pending_have_pieces.insert(packet.connection_id);
+                                }
                             }
                             b"state_notify" => {
                                 merge_connections.insert(packet.connection_id);
@@ -1388,7 +1669,6 @@ impl SyncNode {
                                 mux.send_close(packet.connection_id)?;
                             }
                             b"not_master" => {
-                                trace_sync("not_master", &format!("conn={}", packet.connection_id));
                                 merge_in_flight = None;
                                 sent_get_root = false;
                                 sent_get_nodes = false;
@@ -1421,7 +1701,7 @@ impl SyncNode {
         downloads: &mut HashMap<u32, DownloadSession>,
         sync_state: &mut SyncStateStore,
     ) -> Result<()> {
-        let (content, torrent) = parse_content(message)?;
+        let (wire_content, torrent) = parse_content(message)?;
         let torrent_hash = torrent_file_hash(&torrent)?;
         let path = downloads
             .get(&connection_id)
@@ -1434,7 +1714,7 @@ impl SyncNode {
         if metadata.file_hash != torrent_hash {
             bail!("remote metadata and torrent hash differ for {path}");
         }
-        torrent.verify(&content)?;
+        let content = self.verified_content(&metadata, &torrent, &wire_content)?;
         let conflict_target = downloads
             .get(&connection_id)
             .and_then(|download| download.conflict_target.clone());
@@ -1480,9 +1760,11 @@ impl SyncNode {
             let metadata = remote_files
                 .get(expected_path)
                 .context("DirectTorrent response for unknown download")?;
-            if *expected_path != relative_path
-                || metadata.info_hash(&self.identity.share_id) != info_hash
-            {
+            let encrypted_wire = metadata.protocol_path_string() == relative_path;
+            if !encrypted_wire && metadata.wire_path_string() != relative_path {
+                bail!("DirectTorrent response identity mismatch for {relative_path}");
+            }
+            if !self.direct_info_hash_matches(metadata, &info_hash, encrypted_wire)? {
                 bail!("DirectTorrent response identity mismatch for {relative_path}");
             }
             if signature != metadata.signature {
@@ -1494,12 +1776,21 @@ impl SyncNode {
         }
         let file = local_files
             .iter()
-            .find(|file| file.metadata.wire_path_string() == relative_path)
+            .find(|file| {
+                file.metadata.protocol_path_string() == relative_path
+                    || file.metadata.wire_path_string() == relative_path
+            })
             .with_context(|| format!("DirectTorrent request for unknown file {relative_path}"))?;
-        if self.read_only {
-            bail!("read-only node cannot serve file content");
+        let encrypted_wire = file.metadata.protocol_path_string() == relative_path;
+        if !encrypted_wire && file.metadata.wire_path_string() != relative_path {
+            bail!("DirectTorrent request identity mismatch for {relative_path}");
         }
-        if file.metadata.info_hash(&self.identity.share_id) != info_hash {
+        // A read-only node relays only the ciphertext form; the plaintext body
+        // stays something only the writable holder authorizes.
+        if self.read_only && !encrypted_wire {
+            bail!("read-only node only serves the encrypted wire form");
+        }
+        if !self.direct_info_hash_matches(&file.metadata, &info_hash, encrypted_wire)? {
             bail!("DirectTorrent info hash mismatch for {relative_path}");
         }
         if let Ok(peer_id) = direct_message.get(b"p") {
@@ -1512,19 +1803,37 @@ impl SyncNode {
                 bail!("DirectTorrent share ID mismatch for {relative_path}");
             }
         }
-        let local_signature = self
-            .signing_key
-            .sign(&Sha1::digest(encode(&file.metadata.main())))
-            .to_bytes()
-            .to_vec();
-        if signature != local_signature {
+        if !self.direct_request_signature_matches(
+            signature,
+            &info_hash,
+            &relative_path,
+            &file.metadata,
+            remote_files,
+        )? {
             bail!("DirectTorrent request signature differs for {relative_path}");
         }
+        let ciphertext = self.wire_content(&file.metadata, &file.content, true)?;
+        // A `D`/`E` receiver decrypts locally, so it consumes the *plaintext*
+        // over the piece protocol and validates it against the plaintext hashes
+        // carried (AES-wrapped) by `epieces`; an encrypted-only `F` receiver has
+        // no content key and consumes the ciphertext. The published torrent
+        // info keeps describing the ciphertext either way, because that is the
+        // form `file_hash` was derived from.
+        let served = if encrypted_wire {
+            ciphertext.clone()
+        } else {
+            file.content.clone()
+        };
         if ident_magic == DIRECT_TORRENT_MAGIC_V2 {
             let login = crate::protocol::encode_direct_torrent(direct_message)?;
             mux.send_data(connection_id, &login)?;
         } else {
-            let content = file.metadata.content_message(&file.content)?;
+            let content_key = self.metadata_content_key(&file.metadata)?;
+            let content = file.metadata.content_message_for_wire(
+                &served,
+                &ciphertext,
+                content_key.as_ref(),
+            )?;
             let response = crate::protocol::encode_direct_torrent_body(&content)?;
             mux.send_data(connection_id, &response)?;
         }
@@ -1532,11 +1841,20 @@ impl SyncNode {
             connection_id,
             UploadSession {
                 metadata: file.metadata.clone(),
-                content: file.content.clone(),
+                content: served,
+                torrent_content: ciphertext,
                 remote_metadata_id: None,
             },
         );
         Ok(())
+    }
+
+    /// The torrent info this upload must publish through `ut_metadata`.
+    fn upload_torrent_info(&self, upload: &UploadSession) -> Result<Value> {
+        let content_key = self.metadata_content_key(&upload.metadata)?;
+        upload
+            .metadata
+            .torrent_info_for_content(&upload.torrent_content, content_key.as_ref())
     }
 
     fn start_v2_metadata_download<S: Read + Write>(
@@ -1552,7 +1870,11 @@ impl SyncNode {
         ) {
             return Ok(());
         }
-        let metadata_size = expected_torrent_info_size(metadata.size, metadata.piece_count)?;
+        let metadata_size = expected_torrent_info_size_for_shape(
+            metadata.size,
+            metadata.piece_count,
+            metadata.encrypted_epart.is_some(),
+        )?;
         download.phase = DownloadPhase::MetadataDownloading;
         download.metadata_size = metadata_size;
         let handshake = Value::dict([
@@ -1668,8 +1990,14 @@ impl SyncNode {
                         let expected = remote_files
                             .get(&download.path)
                             .context("metadata for unknown remote file")?;
-                        if torrent_file_hash(&torrent)? != expected.file_hash {
-                            bail!("torrent identity mismatch for {}", download.path);
+                        let torrent_hash = torrent_file_hash(&torrent)?;
+                        if torrent_hash != expected.file_hash {
+                            bail!(
+                                "torrent identity mismatch for {}: torrent={} metadata={}",
+                                download.path,
+                                hex::encode(torrent_hash),
+                                hex::encode(expected.file_hash)
+                            );
                         }
                         download.content = vec![0; torrent.size as usize];
                         download.torrent = Some(torrent);
@@ -1709,7 +2037,7 @@ impl SyncNode {
                 if complete {
                     let path = download.path.clone();
                     let torrent = download.torrent.clone().unwrap();
-                    let content = std::mem::take(&mut download.content);
+                    let wire_content = std::mem::take(&mut download.content);
                     let conflict_target = download.conflict_target.clone();
                     let preserve_target = download.preserve_target;
                     let metadata = remote_files
@@ -1717,6 +2045,7 @@ impl SyncNode {
                         .context("content for unknown remote file")?
                         .clone();
                     downloads.remove(&connection_id);
+                    let content = self.verified_content(&metadata, &torrent, &wire_content)?;
                     self.apply_remote_to(
                         &metadata,
                         &torrent,
@@ -1781,7 +2110,7 @@ impl SyncNode {
                         Some(u8::try_from(remote_metadata_id).map_err(|_| {
                             anyhow::anyhow!("invalid remote metadata extension ID")
                         })?);
-                    let metadata = encode(&upload.metadata.torrent_info());
+                    let metadata = encode(&self.upload_torrent_info(upload)?);
                     let response = Value::dict([
                         (
                             b"m".to_vec(),
@@ -1814,7 +2143,7 @@ impl SyncNode {
                 if message_type != 0 {
                     return Ok(());
                 }
-                let metadata = encode(&upload.metadata.torrent_info());
+                let metadata = encode(&self.upload_torrent_info(upload)?);
                 let start = piece
                     .checked_mul(METADATA_PIECE_SIZE)
                     .context("metadata piece offset overflow")?;
@@ -1908,6 +2237,30 @@ impl SyncNode {
                 metadata.verify_content(&content)?;
                 (metadata, content)
             };
+            // A read-only folder stores what the writer published, so its
+            // entries keep the writer's canonical `main` and signature. Only
+            // the piece hashes are recomputed from the bytes on disk, which is
+            // what lets this node later relay the ciphertext form.
+            if self.read_only {
+                if let Some(authored) = previous
+                    .as_ref()
+                    .filter(|record| record.wire_main.is_some())
+                {
+                    if let Ok(mut restored) = state_record_metadata(authored, &relative) {
+                        if restored.entry_type == EntryType::RegularFile {
+                            restored.piece_hashes = sha1_pieces(&content);
+                        }
+                        let fingerprint = local_fingerprint(&restored);
+                        sync_state.insert_local(&restored, &fingerprint);
+                        files.push(LocalFile {
+                            metadata: restored,
+                            content,
+                            baseline: previous,
+                        });
+                        continue;
+                    }
+                }
+            }
             let fingerprint = local_fingerprint(&metadata);
             if let Some(previous) = &previous {
                 if previous.state == EntryState::Deleted.wire_value() as u8 {
@@ -1922,7 +2275,7 @@ impl SyncNode {
                     metadata.write_times = previous.write_times + 1;
                 }
             }
-            metadata.sign(&self.signing_key)?;
+            self.sign_metadata(&mut metadata)?;
             sync_state.insert_local(&metadata, &fingerprint);
             files.push(LocalFile {
                 metadata,
@@ -1948,7 +2301,7 @@ impl SyncNode {
             let mut metadata = state_record_metadata(&previous, &path)?;
             let fingerprint = local_fingerprint(&metadata);
             metadata = metadata.tombstone(unix_time());
-            metadata.sign(&self.signing_key)?;
+            self.sign_metadata(&mut metadata)?;
             sync_state.insert_local(&metadata, &fingerprint);
             files.push(LocalFile {
                 metadata,
@@ -2001,43 +2354,112 @@ impl SyncNode {
         Ok(false)
     }
 
+    /// Whether file content must travel encrypted to this peer.
+    ///
+    /// Official client 3.1.2 keeps the folder's ciphertext form on the wire for
+    /// *every* peer of an encrypt-capable share: it sends the same encrypted
+    /// bytes to a read-only `E` peer (which decrypts them locally) as to an
+    /// encrypted-only `F` peer (which stores them verbatim). Sending plaintext
+    /// instead made the peer reject the download, because `pieces` inside the
+    /// torrent advertises the SHA-1 of the ciphertext. A peer that cannot
+    /// advertise a signing key is treated as encrypted-only for the same
+    /// reason.
+    /// Whether the `data` body sent to this peer carries ciphertext.
+    ///
+    /// Official client 3.1.2 sends the *plaintext* body to a peer that holds a
+    /// content key (a `D`/`E` reader decrypts locally and stores plaintext) and
+    /// the *ciphertext* body only to an encrypted-only peer that cannot decrypt
+    /// (an `F` reader stores the ciphertext verbatim). Either way `pieces`
+    /// describes the ciphertext; see `content_message_for_wire`.
+    fn wire_is_encrypted(
+        &self,
+        remote_public_key: Option<&[u8; 32]>,
+        peer_encrypted_only: bool,
+    ) -> bool {
+        peer_encrypted_only || remote_public_key.is_none_or(crate::protocol::peer_key_cannot_sign)
+    }
+
     fn send_files<S: Read + Write>(
         &self,
         mux: &mut TunnelMux<'_, S>,
         connection_id: u32,
         files: &[LocalFile],
         paths: &[String],
+        encrypted_wire: bool,
     ) -> Result<()> {
-        if self.read_only {
+        // A read-only node only ever publishes the ciphertext relay form, so a
+        // plaintext request stays unanswered.
+        if self.read_only && !encrypted_wire {
             return Ok(());
         }
         let selected: Vec<&LocalFile> = files
             .iter()
             .filter(|file| {
+                let wire_path = if encrypted_wire {
+                    file.metadata.protocol_path_string()
+                } else {
+                    file.metadata.wire_path_string()
+                };
+                // An encrypted-only peer holds the plaintext tree but not the
+                // encrypted names, so it asks for files by their plaintext path
+                // while expecting the encrypted wire form back. Accept either
+                // name rather than only the one we happen to publish.
+                let plain_path = file.metadata.wire_path_string();
                 paths.is_empty()
-                    || paths
-                        .iter()
-                        .any(|path| path_matches_request(&file.metadata.wire_path_string(), path))
+                    || paths.iter().any(|path| {
+                        path_matches_request(&wire_path, path)
+                            || (encrypted_wire && path_matches_request(&plain_path, path))
+                    })
             })
             .collect();
+        // While relaying, publish the writer's signed entry verbatim: its
+        // `main` is the stored canonical form and its signature already
+        // verifies against the writer's public key the peer was told to use.
+        // Re-signing here would silently swap in this node's own key.
+        if self.read_only && encrypted_wire {
+            let relayed = selected
+                .iter()
+                .map(|file| {
+                    let main = file
+                        .metadata
+                        .main_for_wire(true)
+                        .context("relayed entry has no stored wire form")?;
+                    let mut fields = BTreeMap::new();
+                    if file.metadata.entry_type == EntryType::RegularFile
+                        && file.metadata.state == EntryState::Active
+                    {
+                        fields.insert(
+                            b"have".to_vec(),
+                            Value::Int(file.metadata.piece_hashes.len() as i64),
+                        );
+                    }
+                    fields.insert(b"main".to_vec(), main);
+                    fields.insert(
+                        b"sig".to_vec(),
+                        Value::bytes(file.metadata.signature.clone()),
+                    );
+                    Ok(Value::Dict(fields))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return write_peer_message(
+                mux,
+                connection_id,
+                &Value::dict([
+                    (b"files".to_vec(), Value::List(relayed)),
+                    (b"m".to_vec(), Value::bytes(b"files")),
+                ]),
+            );
+        }
         let signed = selected
             .iter()
             .map(|file| {
-                file.metadata
-                    .signed_file(&self.signing_key, file.metadata.piece_hashes.len() as i64)
+                file.metadata.signed_file_for_wire(
+                    encrypted_wire,
+                    &self.signing_key,
+                    file.metadata.piece_hashes.len() as i64,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
-        trace_sync(
-            "send_files",
-            &format!(
-                "conn={} paths={paths:?} selected={:?}",
-                connection_id,
-                selected
-                    .iter()
-                    .map(|file| file.metadata.wire_path_string())
-                    .collect::<Vec<_>>()
-            ),
-        );
         write_peer_message(
             mux,
             connection_id,
@@ -2060,19 +2482,22 @@ impl SyncNode {
         let torrent_hash = torrent_file_hash(torrent)?;
         if torrent_hash != metadata.file_hash {
             bail!(
-                "torrent identity mismatch for {}",
-                metadata.wire_path_string()
+                "torrent identity mismatch for {}: torrent={} metadata={}",
+                metadata.wire_path_string(),
+                hex::encode(torrent_hash),
+                hex::encode(metadata.file_hash)
             );
         }
-        torrent.verify(content)?;
         let relative = metadata.wire_path_string();
         let target = match conflict_target {
             Some(target) => target,
             None => safe_target(&self.root, &relative)?,
         };
         if preserve_target && target.exists() {
-            let current_hash = regular_file_hash(&target).unwrap_or([0_u8; 20]);
-            if current_hash != metadata.file_hash {
+            let unchanged = fs::read(&target)
+                .map(|current| current == content)
+                .unwrap_or(false);
+            if !unchanged {
                 self.preserve_conflict_sibling(&target, sync_state)?;
             }
         }
@@ -2107,7 +2532,7 @@ impl SyncNode {
                 FileMetadata::from_path(&target, &conflict_relative, self.identity.peer_id)?;
             conflict_metadata.otime = unix_time();
             conflict_metadata.write_times = 2;
-            conflict_metadata.sign(&self.signing_key)?;
+            self.sign_metadata(&mut conflict_metadata)?;
             sync_state.insert_local(&conflict_metadata, &local_fingerprint(&conflict_metadata));
         }
         Ok(())
@@ -2242,7 +2667,7 @@ impl SyncNode {
             .get(&relative)
             .map(|record| record.write_times + 1)
             .unwrap_or(2);
-        metadata.sign(&self.signing_key)?;
+        self.sign_metadata(&mut metadata)?;
         sync_state.insert_local(&metadata, &local_fingerprint(&metadata));
         sync_state.save()?;
         Ok(())
@@ -2538,6 +2963,33 @@ fn have_pieces_message(root_hash: [u8; 20], files: &[LocalFile]) -> Value {
     ])
 }
 
+fn peer_have_pieces_message(
+    root_hash: [u8; 20],
+    remote_files: &HashMap<String, FileMetadata>,
+    local_files: &[LocalFile],
+) -> Result<Value> {
+    let mut remote_entries = remote_files.values().cloned().collect::<Vec<_>>();
+    remote_entries.sort_by(|left, right| left.relative_path.iter().cmp(right.relative_path.iter()));
+    let remote_tree = build_file_tree(&remote_entries)?;
+    if remote_tree.root_hash != root_hash {
+        bail!(
+            "remote tree root mismatch: expected {}, got {}",
+            hex::encode(root_hash),
+            hex::encode(remote_tree.root_hash)
+        );
+    }
+
+    let ordered_entries = tree_metadata_entries(&remote_entries)?;
+    let bitlist = have_pieces_bitlist_for_tree(&ordered_entries, local_files);
+    let hash = have_pieces_hash(root_hash, &bitlist);
+    Ok(Value::dict([
+        (b"bitlist".to_vec(), Value::bytes(bitlist)),
+        (b"hash".to_vec(), Value::bytes(hash)),
+        (b"m".to_vec(), Value::bytes(b"have_pieces")),
+        (b"prev_hash".to_vec(), Value::bytes([0_u8; 20])),
+    ]))
+}
+
 fn get_have_pieces_message() -> Value {
     Value::dict([
         (b"m".to_vec(), Value::bytes(b"get_have_pieces")),
@@ -2552,6 +3004,80 @@ fn have_pieces_bitlist(files: &[LocalFile]) -> Vec<u8> {
             let complete = file.metadata.state == EntryState::Active
                 && (file.metadata.entry_type == EntryType::Directory
                     || file.metadata.size == file.content.len() as u64);
+            if complete {
+                1
+            } else {
+                2
+            }
+        })
+        .collect()
+}
+
+fn tree_metadata_entries(entries: &[FileMetadata]) -> Result<Vec<FileMetadata>> {
+    #[derive(Default)]
+    struct TreeNode {
+        metadata: Option<FileMetadata>,
+        children: BTreeMap<String, TreeNode>,
+    }
+
+    fn insert(root: &mut TreeNode, metadata: &FileMetadata) -> Result<()> {
+        let mut current = root;
+        for (index, component) in metadata.relative_path.iter().enumerate() {
+            current = current.children.entry(component.clone()).or_default();
+            if index + 1 == metadata.relative_path.len() {
+                if current.metadata.is_some() {
+                    bail!("duplicate tree path {}", metadata.wire_path_string());
+                }
+                current.metadata = Some(metadata.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn metadata_for_node(node: &TreeNode) -> Option<&FileMetadata> {
+        node.metadata.as_ref().or_else(|| {
+            node.children
+                .values()
+                .find_map(|child| child.metadata.as_ref())
+        })
+    }
+
+    fn collect(node: &TreeNode, output: &mut Vec<FileMetadata>) {
+        if let Some(metadata) = metadata_for_node(node) {
+            output.push(metadata.clone());
+        }
+        for child in node.children.values() {
+            collect(child, output);
+        }
+    }
+
+    let mut root = TreeNode::default();
+    for metadata in entries {
+        insert(&mut root, metadata)?;
+    }
+    let mut output = Vec::new();
+    for child in root.children.values() {
+        collect(child, &mut output);
+    }
+    Ok(output)
+}
+
+fn have_pieces_bitlist_for_tree(entries: &[FileMetadata], local_files: &[LocalFile]) -> Vec<u8> {
+    let local_by_path = local_files
+        .iter()
+        .map(|file| (file.metadata.wire_path_string(), file))
+        .collect::<HashMap<_, _>>();
+    entries
+        .iter()
+        .map(|metadata| {
+            let complete = local_by_path
+                .get(&metadata.wire_path_string())
+                .is_some_and(|file| {
+                    file.metadata.state == EntryState::Active
+                        && file.metadata.entry_type == metadata.entry_type
+                        && (metadata.entry_type == EntryType::Directory
+                            || file.metadata.size == file.content.len() as u64)
+                });
             if complete {
                 1
             } else {
@@ -2623,11 +3149,69 @@ fn state_notify_requires_reconcile(
     Ok(remote_root != local_root || remote_acl_hash.unwrap_or_else(empty_hash) != local_acl_hash)
 }
 
-fn build_tree(files: &[LocalFile]) -> Result<FileTree> {
+/// SHA-1 of every 32 KiB piece of `content`.
+fn sha1_pieces(content: &[u8]) -> Vec<[u8; 20]> {
+    content
+        .chunks(PIECE_LENGTH as usize)
+        .map(|chunk| Sha1::digest(chunk).into())
+        .collect()
+}
+
+/// The entries a read-only folder relays, rebuilt from its own stored state.
+///
+/// Verified against official client 3.1.2: a read-only `E` folder answers an
+/// encrypted-only `F` peer with the *writer's* identity and the writer's
+/// signed entry forwarded verbatim (its `owner` stays the writer's peer ID and
+/// the signature still verifies against the writer's public key, which is
+/// public material derived from the writable key). The entries are therefore
+/// taken straight from the stored records rather than from a fresh scan, which
+/// would re-sign them under this node's own key and be rejected.
+fn relay_files(root: &Path, sync_state: &SyncStateStore) -> Vec<LocalFile> {
+    let mut files = Vec::new();
+    for (path, record) in sync_state.entries() {
+        if record.state != EntryState::Active.wire_value() as u8 || record.wire_main.is_none() {
+            continue;
+        }
+        let Ok(mut metadata) = state_record_metadata(record, path) else {
+            continue;
+        };
+        let Ok(target) = safe_target(root, path) else {
+            continue;
+        };
+        let Ok(content) = fs::read(&target) else {
+            continue;
+        };
+        if metadata.entry_type == EntryType::RegularFile {
+            metadata.piece_hashes = sha1_pieces(&content);
+        }
+        files.push(LocalFile {
+            metadata,
+            content,
+            baseline: Some(record.clone()),
+        });
+    }
+    files.sort_by_key(|file| file.metadata.relative_path.clone());
+    files
+}
+
+fn build_tree(files: &[LocalFile], encrypted: bool) -> Result<FileTree> {
     build_file_tree(
         &files
             .iter()
-            .map(|file| file.metadata.clone())
+            .map(|file| {
+                let mut metadata = file.metadata.clone();
+                if encrypted {
+                    metadata.relative_path = metadata
+                        .encrypted_path
+                        .clone()
+                        .unwrap_or(metadata.relative_path);
+                } else {
+                    metadata.encrypted_path = None;
+                    metadata.encrypted_epart = None;
+                    metadata.encrypted_main = None;
+                }
+                metadata
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -2724,16 +3308,20 @@ fn normalized_write_times(metadata: &FileMetadata) -> i64 {
     metadata.write_times & 0x3
 }
 
-fn trace_sync(event: &str, detail: &str) {
-    if std::env::var_os("RUSTSYNC_TRACE").is_some() {
-        eprintln!("RUSTSYNC_TRACE {event} {detail}");
-    }
-}
-
 fn write_version_wins(remote: &FileMetadata, local: &FileMetadata) -> bool {
     let remote_wire = normalized_write_times(remote);
     let local_wire = normalized_write_times(local);
-    if remote.write_times != local.write_times && remote_wire != local_wire {
+    // `write_times` only travels as a two-bit wire version, and upstream omits
+    // it entirely for entries it did not version. A zero counter therefore
+    // means "unknown", not "oldest", so the timestamps have to decide. When
+    // both sides do carry a counter, equal wire versions are indistinguishable
+    // on the wire and only a differing pair is a real ordering.
+    if remote.write_times != local.write_times
+        && remote.write_times != 0
+        && local.write_times != 0
+        && remote_wire != local_wire
+        && remote.owner == local.owner
+    {
         return remote.write_times > local.write_times;
     }
     (remote.time_seconds, remote.otime, &remote.owner)
@@ -2833,37 +3421,6 @@ fn file_reconciliation(remote: &FileMetadata, local: &LocalFile) -> FileReconcil
     }
 }
 
-fn regular_file_hash(path: &Path) -> Result<[u8; 20]> {
-    use std::io::Read;
-    if fs::metadata(path)?.len() == 0 {
-        return Ok([0; 20]);
-    }
-    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut piece_hashes = Vec::new();
-    loop {
-        let mut buffer = vec![0_u8; crate::protocol::PIECE_LENGTH as usize];
-        let mut filled = 0;
-        while filled < buffer.len() {
-            let count = file
-                .read(&mut buffer[filled..])
-                .with_context(|| format!("read {}", path.display()))?;
-            if count == 0 {
-                break;
-            }
-            filled += count;
-        }
-        if filled == 0 {
-            break;
-        }
-        let digest: [u8; 20] = Sha1::digest(&buffer[..filled]).into();
-        piece_hashes.extend_from_slice(&digest);
-        if filled < buffer.len() {
-            break;
-        }
-    }
-    Ok(Sha1::digest(piece_hashes).into())
-}
-
 fn remove_path(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2878,14 +3435,7 @@ fn remove_path(path: &Path) -> Result<()> {
 }
 
 fn torrent_file_hash(torrent: &TorrentMetadata) -> Result<[u8; 20]> {
-    if torrent.size == 0 && torrent.piece_hashes.is_empty() {
-        return Ok([0; 20]);
-    }
-    let mut bytes = Vec::with_capacity(torrent.piece_hashes.len() * 20);
-    for piece in &torrent.piece_hashes {
-        bytes.extend_from_slice(piece);
-    }
-    Ok(Sha1::digest(bytes).into())
+    torrent.file_hash()
 }
 
 fn safe_target(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -2958,7 +3508,7 @@ fn state_record_metadata(record: &StateRecord, path: &str) -> Result<FileMetadat
         .context("decode stored file hash")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("stored file hash is not 20 bytes"))?;
-    Ok(FileMetadata {
+    let mut metadata = FileMetadata {
         relative_path: path.split('/').map(str::to_owned).collect(),
         entry_type,
         size: record.size,
@@ -2974,7 +3524,40 @@ fn state_record_metadata(record: &StateRecord, path: &str) -> Result<FileMetadat
         otime: record.otime,
         write_times: record.write_times,
         signature: hex::decode(&record.signature).unwrap_or_default(),
-    })
+        encrypted_path: None,
+        encrypted_epart: None,
+        encrypted_main: None,
+    };
+    if let Some(encoded) = &record.wire_main {
+        let main = decode(&hex::decode(encoded).context("decode stored encrypted main")?)
+            .context("parse stored encrypted main")?;
+        metadata
+            .restore_encrypted_main(main)
+            .context("restore stored encrypted main")?;
+    }
+    Ok(metadata)
+}
+
+/// The Ed25519 identity of a peer whose share key carries no seed.
+///
+/// Stored next to the sync state so the same `pk` is advertised on every run:
+/// a rotating identity would invalidate the metadata this peer published
+/// earlier. The file holds a raw 32-byte seed and is created on first use.
+fn persistent_identity_key(root: &Path) -> SigningKey {
+    let path = root.join(".sync").join("rustsync-identity.key");
+    if let Ok(bytes) = fs::read(&path) {
+        if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            return SigningKey::from_bytes(&seed);
+        }
+    }
+    let mut seed = [0_u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    let key = SigningKey::from_bytes(&seed);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&path, seed);
+    key
 }
 
 fn unix_time() -> i64 {
@@ -3015,7 +3598,7 @@ fn stable_peer_id(key: &ShareKey, device_name: &str) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{parse_torrent_info, EntryState, TorrentMetadata};
+    use crate::protocol::{parse_torrent_info, verify_file_signature, EntryState, TorrentMetadata};
     use tempfile::tempdir;
 
     fn test_sync(root: &Path) -> SyncNode {
@@ -3030,9 +3613,35 @@ mod tests {
         let key = ShareKey::generate_read_write()
             .read_only_link_key()
             .unwrap();
+        // The share key itself carries no Ed25519 seed, so it can never sign.
+        assert!(key.ed25519_signing_key().is_err());
         let sync = SyncNode::new(root.path(), key, "read-only-test").unwrap();
         assert!(sync.read_only);
-        assert!(sync.metadata_public_key.is_none());
+        // The node still advertises a real, non-zero `pk`: the official
+        // read-only peer does the same, and a relayed entry is verified against
+        // exactly that advertised key. Advertising the zero key instead made
+        // every relay look like `bad signature` to the receiving peer.
+        let advertised = sync
+            .metadata_public_key
+            .expect("read-only node advertises a pk");
+        assert_ne!(advertised, [0_u8; 32]);
+        assert_eq!(advertised, sync.identity.identity_key);
+    }
+
+    #[test]
+    fn read_only_identity_is_stable_across_nodes() {
+        // A rotating identity would invalidate metadata this peer published
+        // earlier, so the same root must reuse the same `pk` across restarts.
+        let root = tempdir().unwrap();
+        let key = ShareKey::generate_read_write()
+            .read_only_link_key()
+            .unwrap();
+        let first = SyncNode::new(root.path(), key.clone(), "stable-test").unwrap();
+        let second = SyncNode::new(root.path(), key, "stable-test").unwrap();
+        assert_eq!(
+            first.metadata_public_key, second.metadata_public_key,
+            "the read-only identity must persist across runs"
+        );
     }
 
     fn remote_metadata(relative: &str, content: &[u8]) -> (FileMetadata, TorrentMetadata) {
@@ -3096,6 +3705,60 @@ mod tests {
 
     fn hash_from_hex(value: &str) -> [u8; 20] {
         hex::decode(value).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn direct_request_accepts_signature_from_advertised_remote_metadata() {
+        let root = tempdir().unwrap();
+        let sync = test_sync(root.path());
+        let mut local = local_file_from_bytes(root.path(), "conflict.bin", b"same", None).metadata;
+        local.sign(&sync.signing_key).unwrap();
+
+        let mut remote = local.clone();
+        remote.otime += 1;
+        remote.write_times += 1;
+        remote.sign(&sync.signing_key).unwrap();
+        assert_ne!(local.signature, remote.signature);
+
+        let remote_files = HashMap::from([(remote.wire_path_string(), remote.clone())]);
+        let info_hash = local.info_hash_for_wire(&sync.identity.share_id, false);
+
+        assert!(sync
+            .direct_request_signature_matches(
+                &remote.signature,
+                &info_hash,
+                "conflict.bin",
+                &local,
+                &remote_files,
+            )
+            .unwrap());
+        assert!(sync
+            .direct_request_signature_matches(
+                &local.signature,
+                &info_hash,
+                "conflict.bin",
+                &local,
+                &remote_files,
+            )
+            .unwrap());
+        assert!(!sync
+            .direct_request_signature_matches(
+                &[0_u8; 64],
+                &info_hash,
+                "conflict.bin",
+                &local,
+                &remote_files,
+            )
+            .unwrap());
+        assert!(!sync
+            .direct_request_signature_matches(
+                &remote.signature,
+                &[0_u8; 20],
+                "conflict.bin",
+                &local,
+                &remote_files,
+            )
+            .unwrap());
     }
 
     #[test]
@@ -3354,7 +4017,117 @@ mod tests {
             sync_file_hash: hex::encode(metadata.file_hash),
             sync_fingerprint: local_fingerprint(metadata),
             sync_metadata_hash: hex::encode(metadata.metadata_hash()),
+            wire_main: metadata
+                .encrypted_main
+                .as_ref()
+                .map(|main| hex::encode(encode(main))),
         }
+    }
+
+    #[test]
+    fn read_only_node_relays_the_writers_signed_entry() {
+        // A read-only `E` folder holds no Ed25519 seed, so it cannot sign the
+        // entries it relays. Verified against official client 3.1.2: it answers
+        // an encrypted-only `F` peer with the *writer's* signed entry forwarded
+        // verbatim. This test pins that behaviour at the unit level.
+        let root = tempdir().unwrap();
+        let writer_key = ShareKey::generate_encrypt_capable_read_write();
+        let writer_signing = writer_key.ed25519_signing_key().unwrap();
+        let writer_public = writer_key.ed25519_public_key().unwrap();
+        let content = b"relay-payload".repeat(40);
+        fs::write(root.path().join("relay.bin"), &content).unwrap();
+
+        let mut metadata =
+            FileMetadata::from_path(&root.path().join("relay.bin"), "relay.bin", [0x21; 20])
+                .unwrap();
+        metadata
+            .prepare_encrypted_with_content(&writer_key, &content)
+            .unwrap();
+        metadata.sign(&writer_signing).unwrap();
+        let writer_signature = metadata.signature.clone();
+        let writer_main = metadata.main();
+        assert!(metadata.encrypted_main.is_some());
+        assert!(!writer_signature.is_empty());
+
+        let mut state = SyncStateStore::load(root.path()).unwrap();
+        state.insert_local(&metadata, &local_fingerprint(&metadata));
+        state.save().unwrap();
+        // The store holds an exclusive lock while open, so it must be released
+        // before the node reopens the same state file.
+        drop(state);
+
+        let read_only = SyncNode::new(
+            root.path(),
+            writer_key.read_only_link_key().unwrap(),
+            "relay-test",
+        )
+        .unwrap();
+        assert!(read_only.read_only);
+
+        // A rescan must keep the writer's canonical form and signature instead
+        // of re-signing the entry under this node's own identity.
+        let mut state = SyncStateStore::load(root.path()).unwrap();
+        let files = read_only.scan_files(&mut state).unwrap();
+        let scanned = files
+            .iter()
+            .find(|file| file.metadata.wire_path_string() == "relay.bin")
+            .expect("relay file is scanned");
+        assert_eq!(scanned.metadata.signature, writer_signature);
+        assert_eq!(scanned.metadata.encrypted_main.as_ref(), Some(&writer_main));
+        verify_file_signature(
+            &writer_public,
+            &scanned.metadata.main(),
+            &scanned.metadata.signature,
+        )
+        .unwrap();
+
+        // The relayed entry handed to the peer carries the same signature and
+        // still verifies against the writer's public key.
+        let relayed = relay_files(root.path(), &state);
+        let entry = relayed
+            .iter()
+            .find(|file| file.metadata.wire_path_string() == "relay.bin")
+            .expect("relay entry is rebuilt from stored state");
+        assert_eq!(entry.metadata.signature, writer_signature);
+        assert_eq!(entry.metadata.encrypted_main.as_ref(), Some(&writer_main));
+        verify_file_signature(
+            &writer_public,
+            &entry.metadata.main(),
+            &entry.metadata.signature,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_only_node_without_a_stored_writer_form_signs_itself() {
+        // Without a stored canonical form there is nothing to relay, so the
+        // node signs the entry under its own persistent identity rather than
+        // publishing an unsigned object.
+        let root = tempdir().unwrap();
+        let writer_key = ShareKey::generate_encrypt_capable_read_write();
+        let content = b"fresh-read-only-content";
+        fs::write(root.path().join("fresh.bin"), content).unwrap();
+
+        let read_only = SyncNode::new(
+            root.path(),
+            writer_key.read_only_link_key().unwrap(),
+            "relay-fresh",
+        )
+        .unwrap();
+        let mut state = SyncStateStore::load(root.path()).unwrap();
+        let files = read_only.scan_files(&mut state).unwrap();
+        let scanned = files
+            .iter()
+            .find(|file| file.metadata.wire_path_string() == "fresh.bin")
+            .expect("fresh file is scanned");
+        assert!(!scanned.metadata.signature.is_empty());
+        assert!(scanned.metadata.encrypted_main.is_some());
+        verify_file_signature(
+            &read_only.identity.identity_key,
+            &scanned.metadata.main(),
+            &scanned.metadata.signature,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3793,6 +4566,59 @@ mod tests {
             normalized_write_times(&remote),
             normalized_write_times(&local.metadata)
         );
+        assert_eq!(
+            file_reconciliation(&remote, &local),
+            FileReconciliation::RemoteWins
+        );
+    }
+
+    #[test]
+    fn omitted_upstream_write_times_use_time_to_accept_remote_tombstone() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("upstream-delete.txt");
+        fs::write(&path, b"base").unwrap();
+        let active = FileMetadata::from_path(&path, "upstream-delete.txt", [3_u8; 20]).unwrap();
+        let local_metadata = FileMetadata {
+            write_times: 3,
+            time_seconds: 1_000,
+            ..active.clone()
+        };
+        let local = LocalFile {
+            metadata: local_metadata,
+            content: b"base".to_vec(),
+            baseline: Some(baseline_record(&active)),
+        };
+        let mut remote = active.tombstone(2_000);
+        remote.write_times = 0;
+
+        assert_eq!(normalized_write_times(&remote), 0);
+        assert_eq!(
+            file_reconciliation(&remote, &local),
+            FileReconciliation::RemoteWins
+        );
+    }
+
+    #[test]
+    fn write_times_from_other_owner_do_not_block_remote_tombstone() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("other-owner-delete.txt");
+        fs::write(&path, b"base").unwrap();
+        let active = FileMetadata::from_path(&path, "other-owner-delete.txt", [3_u8; 20]).unwrap();
+        let local_metadata = FileMetadata {
+            write_times: 3,
+            time_seconds: 1_000,
+            ..active.clone()
+        };
+        let local = LocalFile {
+            metadata: local_metadata,
+            content: b"base".to_vec(),
+            baseline: Some(baseline_record(&active)),
+        };
+        let mut remote = active.tombstone(2_000);
+        remote.owner = [9_u8; 20];
+        remote.write_times = 2;
+
+        assert_ne!(remote.owner, local.metadata.owner);
         assert_eq!(
             file_reconciliation(&remote, &local),
             FileReconciliation::RemoteWins

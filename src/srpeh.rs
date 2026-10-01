@@ -258,9 +258,20 @@ pub struct HandshakeMaterial {
     pub session_key: [u8; 40],
     pub client_nonce: [u8; 16],
     pub server_nonce: [u8; 16],
+    /// The share type the *peer* declared in its handshake request.
+    ///
+    /// `Some(4)` means the peer holds only the encrypted key, so it can neither
+    /// decrypt content nor verify a plaintext signature: every file published
+    /// to it must use the encrypted wire form.
+    pub peer_share_type: Option<i64>,
 }
 
 impl HandshakeMaterial {
+    /// Whether the peer announced the encrypted-only role during the handshake.
+    pub fn peer_is_encrypted_only(&self) -> bool {
+        self.peer_share_type == Some(ShareKey::ENCRYPTED_SHARE_TYPE)
+    }
+
     pub fn client_stream<S: Read + Write>(self, stream: S) -> EncryptedStream<S> {
         EncryptedStream::new(
             stream,
@@ -434,7 +445,9 @@ pub fn client_handshake_material<S: Read + Write>(
     stream: &mut S,
     key: &ShareKey,
 ) -> Result<HandshakeMaterial> {
-    client_handshake_material_inner(stream, key, None)
+    // The role decides both the declared `type` and the password the server
+    // will select for it, so the two must always be derived from the same key.
+    client_handshake_material_inner(stream, key, key.srpeh_share_type())
 }
 
 pub fn client_handshake_material_with_type<S: Read + Write>(
@@ -451,7 +464,6 @@ fn client_handshake_material_inner<S: Read + Write>(
     share_type: Option<i64>,
 ) -> Result<HandshakeMaterial> {
     let username = key.share_id();
-    let password = key.tls_psk()?;
     let client_nonce = random_16();
     let mut fields = vec![
         (b"nonce".to_vec(), Value::bytes(client_nonce.to_vec())),
@@ -466,6 +478,18 @@ fn client_handshake_material_inner<S: Read + Write>(
     let response = decode(&response)?;
     let server_public = response.get(b"pub")?.as_bytes()?.to_vec();
     let salt = response.get(b"salt")?.as_bytes()?.to_vec();
+    // The responder announces its own role in the reply, and that declaration
+    // selects the SRP password for the exchange: `type=4` means the responder
+    // is encrypted-only, so the 20-byte access key is the password even when we
+    // hold a `D`/`E` key. Proving the 36-byte read-only body against such a
+    // responder fails its verifier, which is exactly the "client proof
+    // mismatch" seen when an `F` peer answers a `D`/`E` dialer.
+    let responder_share_type = response
+        .get(b"type")
+        .ok()
+        .map(|value| value.as_int())
+        .transpose()?;
+    let password = key.tls_psk_for_share_type(responder_share_type.or(share_type))?;
     let client = SrpClient::new(&username, &password, &salt)?;
     let (key, client_proof) = client.proof(&server_public)?;
     let client_response = Value::dict([
@@ -489,6 +513,7 @@ fn client_handshake_material_inner<S: Read + Write>(
         session_key: key,
         client_nonce,
         server_nonce,
+        peer_share_type: responder_share_type,
     })
 }
 
@@ -514,13 +539,32 @@ pub fn server_handshake_material<S: Read + Write>(
     if username != key.share_id() {
         bail!("SRPEH share ID mismatch");
     }
-    let password = key.tls_psk()?;
+    // A peer declares `type=4` when it holds only the encrypted key; such a
+    // peer authenticates with the 20-byte access key rather than the 36-byte
+    // read-only body. Ignoring the field fails every encrypted-only handshake
+    // with a client proof mismatch.
+    let declared_share_type = request
+        .get(b"type")
+        .ok()
+        .map(|value| value.as_int())
+        .transpose()?;
+    // The *responder's* own role also selects the password, because the dialer
+    // derives it from the type we announce below: an encrypted-only server
+    // authenticates with the 20-byte access key even against a `D`/`E` dialer
+    // that sent no `type` at all. Announcing our role and deriving from it is
+    // what lets an `F` folder answer peers instead of only dialing them.
+    let responder_share_type = key.srpeh_share_type();
+    let password = key.tls_psk_for_share_type(declared_share_type.or(responder_share_type))?;
     let salt = random_16();
     let server = SrpServer::new(&username, &password, &salt)?;
-    let response = Value::dict([
+    let mut response_fields = vec![
         (b"pub".to_vec(), Value::bytes(server.public().to_vec())),
         (b"salt".to_vec(), Value::bytes(salt.to_vec())),
-    ]);
+    ];
+    if let Some(responder_share_type) = responder_share_type {
+        response_fields.push((b"type".to_vec(), Value::Int(responder_share_type)));
+    }
+    let response = Value::dict(response_fields);
     write_frame(stream, &encode(&response))?;
     let client_response = decode(&read_frame(stream)?)?;
     let client_public = client_response.get(b"pub")?.as_bytes()?.to_vec();
@@ -544,6 +588,7 @@ pub fn server_handshake_material<S: Read + Write>(
         session_key: derived,
         client_nonce,
         server_nonce,
+        peer_share_type: declared_share_type,
     })
 }
 
@@ -741,6 +786,31 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_only_responder_selects_the_access_key_for_both_sides() {
+        // Mirrors the official client: the responder announces `type=4` in the
+        // SRPEH reply, and the dialer derives the 20-byte access key from that
+        // declaration instead of the 36-byte read-only body. A `D`/`E` dialer
+        // sends no `type` at all, so only the responder's own role can select
+        // the password for an encrypted-only responder.
+        let key = ShareKey::parse("FH5L5UOAVPTVUQTRQRVGFD5XGUQB5B6ZD").unwrap();
+        let read_write = ShareKey::parse("DJMJ5MWYMBKS5SCWMBRQ7LXBGZAQGLSAQ").unwrap();
+        assert_eq!(key.srpeh_share_type(), Some(ShareKey::ENCRYPTED_SHARE_TYPE));
+        assert_eq!(read_write.srpeh_share_type(), None);
+        assert_eq!(
+            read_write
+                .tls_psk_for_share_type(Some(ShareKey::ENCRYPTED_SHARE_TYPE))
+                .unwrap(),
+            key.tls_psk().unwrap(),
+            "a D key must authenticate an encrypted-only peer with the access key"
+        );
+        assert_ne!(
+            read_write.tls_psk().unwrap(),
+            key.tls_psk().unwrap(),
+            "the ordinary role keeps using the 36-byte read-only body"
+        );
+    }
+
+    #[test]
     fn srpeh_stream_cipher_uses_directional_split_material() {
         let mut session_key = [0_u8; 40];
         for (index, value) in session_key.iter_mut().enumerate() {
@@ -752,6 +822,7 @@ mod tests {
             session_key,
             client_nonce: [0x10; 16],
             server_nonce: [0x20; 16],
+            peer_share_type: None,
         };
         let mut client = std::io::Cursor::new(Vec::new());
         let mut server = std::io::Cursor::new(Vec::new());
@@ -800,6 +871,7 @@ mod tests {
             session_key,
             client_nonce: [0x10; 16],
             server_nonce: [0x20; 16],
+            peer_share_type: None,
         };
 
         let client = material

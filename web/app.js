@@ -151,12 +151,35 @@ function renderFolders() {
       ? `${folder.last_scan.file_count} 个文件 · ${formatBytes(folder.last_scan.total_file_size)}`
       : folder.enabled ? "尚未扫描" : "已停用";
     const syncText = folder.sync
-      ? `${folder.sync.access === "read-write" ? "读写" : "只读"} · ${folder.sync.peers.length} 个节点`
+      ? `${folder.sync.access === "read-write" ? "读写" : folder.sync.access === "encrypted-only" ? "加密" : "只读"} · ${folder.sync.peers.length} 个节点`
       : "仅扫描";
     const lastSyncText = folder.last_sync
       ? ` · 上次同步${folder.last_sync.status === "success" ? "成功" : folder.last_sync.status === "error" ? "失败" : folder.last_sync.status === "partial" ? "部分成功" : "中"}`
       : "";
     meta.textContent = `${scanText} · ${syncText}${lastSyncText}`;
+
+    const keyList = document.createElement("div");
+    keyList.className = "folder-keys";
+    const derivedKeys = folder.sync?.keys || {};
+    const keyRoles = [
+      ["read_write", "读写密钥"],
+      ["read_only", "只读密钥"],
+      ["encrypted", "加密密钥"],
+    ];
+    for (const [role, label] of keyRoles) {
+      const value = derivedKeys[role];
+      if (!value) {
+        continue;
+      }
+      const keyRow = document.createElement("div");
+      keyRow.className = "folder-key";
+      const keyLabel = document.createElement("span");
+      keyLabel.textContent = label;
+      const keyValue = document.createElement("code");
+      keyValue.textContent = value;
+      keyRow.append(keyLabel, keyValue, iconButton("⧉", `复制${label}`, () => copyKey(value)));
+      keyList.append(keyRow);
+    }
 
     if (folder.sync) {
       const autoLabel = document.createElement("label");
@@ -179,12 +202,6 @@ function renderFolders() {
       ...(folder.sync
         ? [
             iconButton("⇄", "立即同步", () => syncFolder(folder.id)),
-            labeledButton("读写链接", "生成读写链接", () =>
-              generateFolderLink(folder.id, "read-write"),
-            ),
-            labeledButton("只读链接", "生成只读链接", () =>
-              generateFolderLink(folder.id, "read-only"),
-            ),
           ]
         : []),
       iconButton(folder.enabled ? "Ⅱ" : "▶", folder.enabled ? "停用" : "启用", () =>
@@ -194,7 +211,7 @@ function renderFolders() {
       iconButton("×", "删除", () => deleteFolder(folder)),
     );
 
-    row.append(name, path, meta, actions);
+    row.append(name, path, meta, keyList, actions);
     elements.folderList.append(row);
   }
 }
@@ -210,15 +227,13 @@ function iconButton(symbol, label, action) {
   return button;
 }
 
-function labeledButton(text, label, action) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "labeled-action";
-  button.textContent = text;
-  button.title = label;
-  button.setAttribute("aria-label", label);
-  button.addEventListener("click", action);
-  return button;
+async function copyKey(value) {
+  if (!value) {
+    return;
+  }
+  await navigator.clipboard?.writeText(value);
+  elements.toolOutput.textContent = value;
+  showToast("密钥已复制。");
 }
 
 function editFolder(folder) {
@@ -453,7 +468,7 @@ elements.folderForm.addEventListener("submit", async (event) => {
     if (elements.folderLinkMode.value === "import") {
       sync.link = elements.folderLink.value.trim();
     } else {
-      sync.access = elements.folderLinkMode.value === "generate-ro" ? "read-only" : "read-write";
+      sync.access = "read-write";
     }
     payload.sync = sync;
   } else if (state.folders.some((folder) => folder.id === id && folder.sync)) {

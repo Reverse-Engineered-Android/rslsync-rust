@@ -4,6 +4,7 @@ pub mod bencode;
 pub mod client;
 pub mod discovery;
 pub mod encrypted;
+pub mod encrypted_folder;
 pub mod model;
 pub mod operations;
 pub mod peer;

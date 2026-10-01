@@ -77,19 +77,45 @@ not authenticate the peer. Authentication occurs in SRPEH.
 | Key type | Read/write behavior | Authentication PSK | Metadata signing |
 |---|---|---|---|
 | `A` | writable | `SHA-1(Ed25519 public key)` | derived Ed25519 secret |
-| `D` | writable | `SHA-1(Ed25519 public key)` | derived Ed25519 secret |
+| `D` | writable encrypted-capable | `Keccak-256(Ed25519 public key)[..20]` | derived Ed25519 secret |
 | `B` | read-only compatibility | decoded 20-byte key body | not available |
-| `E` | read-only compatibility | decoded 20-byte key body | not available |
+| `E` | read-only encrypted-capable | decoded first 20 bytes of key body | not available |
+| `F` | encrypted-only | decoded 20-byte key body | not available |
 
-For all supported types:
+For `A/B`:
 
 ```text
-share_id = SHA-1(psk)[20]
+share_id = SHA-1(access_key)[..20]
 ```
+
+For `D/E/F`:
+
+```text
+share_id = Keccak-256(access_key)[..20]
+```
+
+`D` derives `E` from `F-body || Keccak-256(D-body)[..16]` and `F` from
+`Keccak-256(D-public-key)[..20]`. `E` derives `F` from its first 20 bytes.
+`F` has no content-decryption key and must never receive plaintext writes.
 
 The A/D `id.pk` field is the same 32-byte Ed25519 public key used to verify
 file metadata. Sending an unrelated identity constant makes the official peer
 report `bad_signature`.
+
+### 3.1 Encrypted content transform
+
+For a plaintext piece hash `H`, piece start offset `O`, and 16-byte content key
+`K`, the official per-piece base nonce is:
+
+```text
+base_nonce = SHA-1(K || H || LE64(O))[..16]
+```
+
+Each 16-byte content block uses `base_nonce` with its low eight bytes XORed by
+the absolute file block offset, encrypts that counter with AES-128-ECB under
+`K`, and XORs the resulting keystream with the block. `D` derives `K` as
+`Keccak-256(D-body)[..16]`; `E` carries the same key in bytes 20..36 of its
+body. `F` receives transformed bytes but cannot derive `K`.
 
 ## 4. SRPEH
 
@@ -168,7 +194,16 @@ server resp = SHA1(A || client_resp || key)[20]
 ```
 
 `MGF1-SHA1` emits 40 bytes as `SHA1(shared || u32_be counter)` for counters
-`0, 1`. `username` is the 20-byte share ID and `password` is the 20-byte PSK.
+`0, 1`. `username` is the 20-byte share ID.
+
+The password depends on the roles the two peers declare. A peer that holds only
+the encrypted key adds `type = 4` to the SRPEH request, and a responder whose
+own key is encrypted-only adds `type = 4` to its reply. `type = 4` selects the
+20-byte access key as the password; otherwise a `D`/`E` peer proves the full
+36-byte read-only body and an `A`/`B` peer the 20-byte PSK. Both sides derive
+the password from the declaration, so an encrypted-only folder can both dial and
+answer `D`/`E` peers. Ignoring `type` makes every encrypted-only handshake fail
+with a client proof mismatch.
 
 ### 4.4 Directional AES Streams
 

@@ -6,12 +6,14 @@ with the official Linux client over direct TCP + SRPEH, exchanges signed merge
 metadata, and transfers verified file content through both DirectTorrent 3.1.2
 response modes. The verified core is bidirectional in both directions.
 
-The compatibility boundary is intentionally explicit. Regular files, nested
-paths, directories, tombstones, recreation, metadata changes, and deterministic
-conflict preservation are implemented. The additional encrypted-folder,
-selective-sync, POSIX-permission, and tracker layers are independent Rust
-designs implemented in this repository; they do not depend on proprietary
-client code or configuration. See [`COMPATIBILITY.md`](COMPATIBILITY.md).
+The compatibility boundary is intentionally explicit. Regular Standard Folder
+files, nested paths, directories, tombstones, recreation, metadata changes, and
+deterministic conflict preservation are implemented. Standard Folder `A/B`
+keys and encrypt-capable `D/E/F` keys are supported; Advanced Folder keys and
+their ACL/managed-folder features are deliberately rejected. The confirmed
+official encrypted-content transform is implemented, while the independent
+vault, selective-sync, POSIX-permission, and tracker layers remain separate
+Rust designs. See [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
 ## Linux Quick Start
 
@@ -143,10 +145,22 @@ Generate a writable compatibility key:
 cargo run -- generate-key --read-write
 ```
 
+Derive the linked roles of an existing key (`--derive read-only|encrypted|read-write`):
+
+```bash
+cargo run -- generate-key --from 'D...' --derive read-only
+cargo run -- generate-key --from 'D...' --derive encrypted
+```
+
+`--from`/`--derive` output matches the official binary's `--get-ro-secret` for
+the read-only role and its `encryptedsecret` field for the encrypted role.
+
 For two-way upstream interoperability use an `A` or `D` read-write key. `B` and
 `E` keys parse and derive authentication material, but cannot sign new A/D
-metadata. The share ID is `SHA-1(PSK)`. For A/D keys the 20-byte PSK is
-`SHA-1(Ed25519_public_key)`; B/E keys use their decoded 20-byte body.
+metadata. `F` is the encrypted-only role and cannot decrypt local file content.
+`A/B` share IDs are `SHA-1(access-key)`; `D/E/F` share IDs are the first 20
+bytes of `Keccak-256(access-key)`. `D` derives `E` and `F`; `E` derives `F`.
+The web console displays the derived role keys for `D` and `E` folders.
 
 ## Upstream Modes
 
@@ -231,6 +245,7 @@ machines are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 - `src/selective.rs`: portable include/exclude path matching.
 - `src/permissions.rs`: POSIX permission metadata and policy enforcement.
 - `src/encrypted.rs`: authenticated encrypted-folder vault format.
+- `src/encrypted_folder.rs`: official D/E/F piece nonce and AES content transform.
 - `src/tracker.rs`: independent HTTP tracker protocol and registry.
 - `src/acl.rs`: signed ACL entry model and deterministic ACL hashes.
 - `src/secret.rs`: non-secret share-key and signing-key derivation.

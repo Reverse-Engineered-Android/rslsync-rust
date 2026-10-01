@@ -37,20 +37,48 @@ pub struct PeerIdentity {
 
 impl PeerIdentity {
     pub fn from_key(name: impl Into<String>, key: &ShareKey, peer_id: [u8; 20]) -> Result<Self> {
-        Ok(Self {
+        Ok(Self::from_keys(
+            name,
+            key.share_id(),
+            key.ed25519_public_key().unwrap_or([0; 32]),
+            peer_id,
+        ))
+    }
+
+    /// Build an identity whose advertised key need not come from the share key.
+    ///
+    /// A read-only share key carries no Ed25519 seed, yet the official
+    /// read-only peer still advertises a real `pk` and signs every entry it
+    /// relays with it; the receiver verifies against that advertised key.
+    pub fn from_keys(
+        name: impl Into<String>,
+        share_id: [u8; 20],
+        identity_key: [u8; 32],
+        peer_id: [u8; 20],
+    ) -> Self {
+        Self {
             name: name.into(),
             peer_id,
-            identity_key: key.ed25519_public_key().unwrap_or([0; 32]),
-            share_id: key.share_id(),
-        })
+            identity_key,
+            share_id,
+        }
     }
 
     pub fn id_message(&self) -> Value {
+        self.id_message_with_key(self.identity_key)
+    }
+
+    /// The `id` message announcing a different metadata signing key.
+    ///
+    /// A read-only folder relaying the writer's signed entries must announce
+    /// the writer's public key, because that is what the receiver verifies
+    /// those entries against.
+    pub fn id_message_with_key(&self, identity_key: [u8; 32]) -> Value {
         Value::dict([
             (b"m".to_vec(), Value::bytes(b"id")),
             (b"name".to_vec(), Value::bytes(self.name.clone())),
             (b"peer".to_vec(), Value::bytes(self.peer_id)),
-            (b"pk".to_vec(), Value::bytes(self.identity_key)),
+            (b"pk".to_vec(), Value::bytes(identity_key)),
             (b"share".to_vec(), Value::bytes(self.share_id)),
             (b"tags".to_vec(), Value::List(Vec::new())),
             (
@@ -59,6 +87,27 @@ impl PeerIdentity {
             ),
         ])
     }
+}
+
+/// The metadata signing key a peer advertises in its `m=id` message.
+///
+/// A read-only peer holds no Ed25519 key and therefore omits `pk` entirely
+/// (verified against official client 3.1.2). Such a peer cannot sign file
+/// metadata, which the rest of the code represents as an all-zero key, so the
+/// absent field is not an error.
+pub fn peer_identity_key(message: &Value) -> Result<[u8; 32]> {
+    match message.get(b"pk") {
+        Ok(value) => value
+            .as_bytes()?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("peer identity key is not 32 bytes")),
+        Err(_) => Ok([0_u8; 32]),
+    }
+}
+
+/// Whether a peer's advertised key marks it as unable to sign metadata.
+pub fn peer_key_cannot_sign(public_key: &[u8; 32]) -> bool {
+    *public_key == [0_u8; 32]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +157,9 @@ pub struct FileMetadata {
     pub otime: i64,
     pub write_times: i64,
     pub signature: Vec<u8>,
+    pub encrypted_path: Option<Vec<String>>,
+    pub encrypted_epart: Option<Vec<u8>>,
+    pub encrypted_main: Option<Value>,
 }
 
 impl FileMetadata {
@@ -125,7 +177,6 @@ impl FileMetadata {
         let mut file =
             std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut piece_hashes = Vec::new();
-        let mut piece_hash_bytes = Vec::new();
         let mut buffer = vec![0_u8; PIECE_LENGTH as usize];
         loop {
             let mut filled = 0;
@@ -143,7 +194,6 @@ impl FileMetadata {
             }
             let digest: [u8; 20] = Sha1::digest(&buffer[..filled]).into();
             piece_hashes.push(digest);
-            piece_hash_bytes.extend_from_slice(&digest);
             if filled < buffer.len() {
                 break;
             }
@@ -153,7 +203,7 @@ impl FileMetadata {
         let file_hash = if metadata.len() == 0 {
             [0; 20]
         } else {
-            Sha1::digest(&piece_hash_bytes).into()
+            standard_file_hash(&piece_hashes)?
         };
         Ok(Self {
             relative_path: split_path(relative_path)?,
@@ -171,6 +221,9 @@ impl FileMetadata {
             otime: mtime_seconds,
             write_times: 2,
             signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
         })
     }
 
@@ -204,6 +257,9 @@ impl FileMetadata {
             otime,
             write_times: 2,
             signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
         })
     }
 
@@ -215,6 +271,9 @@ impl FileMetadata {
             piece_hashes: Vec::new(),
             random_prefix: Vec::new(),
             signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
             ..self.clone()
         }
     }
@@ -227,10 +286,91 @@ impl FileMetadata {
         Ok(())
     }
 
+    pub fn prepare_encrypted(&mut self, key: &ShareKey) -> Result<()> {
+        use crate::secret::ShareKeyFamily;
+
+        if key.family() != ShareKeyFamily::EncryptCapable || key.is_encrypted_only() {
+            return Ok(());
+        }
+        // The canonical form changes, so a signature computed over the
+        // previous (plaintext) form must not be reused.
+        self.signature.clear();
+        let content_key = key.encryption_key()?;
+        let encrypted_path = crate::encrypted_folder::wrap_path(&content_key, &self.relative_path)?;
+        let protected_mtime = match self.entry_type {
+            EntryType::RegularFile => Some(self.mtime_seconds),
+            EntryType::Directory => None,
+        };
+        let encrypted_epart = crate::encrypted_folder::encrypt_epart(
+            &content_key,
+            protected_mtime,
+            self.time_seconds,
+            crate::encrypted_folder::normalize_mode(self.mode),
+            self.entry_type.wire_value(),
+            self.write_times,
+        )?;
+        self.encrypted_path = Some(encrypted_path);
+        self.encrypted_epart = Some(encrypted_epart);
+        self.encrypted_main = Some(self.build_encrypted_main()?);
+        Ok(())
+    }
+
+    pub fn prepare_encrypted_with_content(&mut self, key: &ShareKey, content: &[u8]) -> Result<()> {
+        self.prepare_encrypted(key)?;
+        if self.encrypted_epart.is_none()
+            || self.entry_type != EntryType::RegularFile
+            || self.state != EntryState::Active
+            || self.size == 0
+        {
+            return Ok(());
+        }
+        // `file_hash` is the info-hash of the torrent the receiver rebuilds
+        // from the wire form, and that torrent advertises the *ciphertext*
+        // piece hashes (the bytes that travel in `data`). Derive it from the
+        // encrypted content so a peer can match it byte for byte.
+        let content_key = key.encryption_key()?;
+        let wire_content = crate::encrypted_folder::encrypt_content(
+            &content_key,
+            &self.piece_hashes,
+            PIECE_LENGTH as usize,
+            content,
+        )?;
+        let torrent_info = self.torrent_info_for_content(&wire_content, Some(&content_key))?;
+        let torrent_metadata = Value::dict([(b"info".to_vec(), torrent_info)]);
+        self.file_hash = Sha1::digest(encode(&torrent_metadata)).into();
+        self.encrypted_main = Some(self.build_encrypted_main()?);
+        Ok(())
+    }
+
+    pub fn restore_encrypted_main(&mut self, main: Value) -> Result<()> {
+        let path = main
+            .get(b"path")?
+            .as_list()?
+            .iter()
+            .map(|part| {
+                String::from_utf8(part.as_bytes()?.to_vec()).context("encrypted path is not UTF-8")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let epart = main.get(b"epart")?.as_bytes()?.to_vec();
+        self.encrypted_path = Some(path);
+        self.encrypted_epart = Some(epart);
+        self.encrypted_main = Some(main);
+        Ok(())
+    }
+
     pub fn info_hash(&self, share_id: &[u8; 20]) -> [u8; 20] {
+        self.info_hash_for_wire(share_id, self.encrypted_path.is_some())
+    }
+
+    pub fn info_hash_for_wire(&self, share_id: &[u8; 20], encrypted: bool) -> [u8; 20] {
         let mut hasher = Sha1::new();
         hasher.update(share_id);
-        for (index, component) in self.relative_path.iter().enumerate() {
+        let path = if encrypted {
+            self.encrypted_path.as_ref().unwrap_or(&self.relative_path)
+        } else {
+            &self.relative_path
+        };
+        for (index, component) in path.iter().enumerate() {
             if index != 0 {
                 hasher.update([0]);
             }
@@ -241,10 +381,30 @@ impl FileMetadata {
     }
 
     pub fn wire_path(&self) -> Vec<u8> {
-        self.relative_path.join("/").into_bytes()
+        self.encrypted_path
+            .as_ref()
+            .unwrap_or(&self.relative_path)
+            .join("/")
+            .into_bytes()
     }
 
     pub fn main(&self) -> Value {
+        if let Some(main) = &self.encrypted_main {
+            return main.clone();
+        }
+        self.plain_main()
+    }
+
+    pub fn plain_main(&self) -> Value {
+        // Inside an encrypted folder upstream folds the mode to `0644`/`0755`
+        // (any execute bit wins) before publishing it; the exact mode only
+        // travels in the protected `epart`. Publishing the raw mode here made
+        // peers reject the signature, which always covers the canonical form.
+        let wire_mode = if self.encrypted_epart.is_some() {
+            i64::from(crate::encrypted_folder::normalize_mode(self.mode))
+        } else {
+            self.mode as i64
+        };
         let mut path = Vec::with_capacity(self.relative_path.len());
         for component in &self.relative_path {
             path.push(Value::bytes(component.clone()));
@@ -254,7 +414,7 @@ impl FileMetadata {
             fields.insert(b"otime".to_vec(), Value::Int(self.otime));
             fields.insert(b"owner".to_vec(), Value::bytes(self.owner));
             fields.insert(b"path".to_vec(), Value::List(path));
-            fields.insert(b"perm".to_vec(), Value::Int(self.mode as i64));
+            fields.insert(b"perm".to_vec(), Value::Int(wire_mode));
             fields.insert(b"state".to_vec(), Value::Int(self.state.wire_value()));
             fields.insert(b"time".to_vec(), Value::Int(self.time_seconds));
             fields.insert(b"type".to_vec(), Value::Int(self.entry_type.wire_value()));
@@ -273,7 +433,7 @@ impl FileMetadata {
         fields.insert(b"otime".to_vec(), Value::Int(self.otime));
         fields.insert(b"owner".to_vec(), Value::bytes(self.owner));
         fields.insert(b"path".to_vec(), Value::List(path));
-        fields.insert(b"perm".to_vec(), Value::Int(self.mode as i64));
+        fields.insert(b"perm".to_vec(), Value::Int(wire_mode));
         fields.insert(b"size".to_vec(), Value::Int(self.size as i64));
         fields.insert(b"state".to_vec(), Value::Int(self.state.wire_value()));
         fields.insert(b"time".to_vec(), Value::Int(self.time_seconds));
@@ -284,13 +444,80 @@ impl FileMetadata {
         Value::Dict(fields)
     }
 
+    fn build_encrypted_main(&self) -> Result<Value> {
+        let path = self
+            .encrypted_path
+            .as_ref()
+            .context("encrypted metadata path is missing")?
+            .iter()
+            .map(|component| Value::bytes(component.clone()))
+            .collect::<Vec<_>>();
+        let epart = self
+            .encrypted_epart
+            .clone()
+            .context("encrypted metadata epart is missing")?;
+        let wire_mode = i64::from(crate::encrypted_folder::ENCRYPTED_WIRE_MODE);
+        let mut fields = BTreeMap::new();
+        fields.insert(b"epart".to_vec(), Value::bytes(epart));
+        // The encrypted wire form always publishes `0644` and drops
+        // `write_times`: the real mode and version bits live inside `epart`.
+        if self.entry_type == EntryType::Directory {
+            fields.insert(b"otime".to_vec(), Value::Int(self.otime));
+            fields.insert(b"owner".to_vec(), Value::bytes(self.owner));
+            fields.insert(b"path".to_vec(), Value::List(path));
+            fields.insert(b"perm".to_vec(), Value::Int(wire_mode));
+            fields.insert(b"state".to_vec(), Value::Int(self.state.wire_value()));
+            fields.insert(b"time".to_vec(), Value::Int(self.time_seconds));
+            fields.insert(b"type".to_vec(), Value::Int(self.entry_type.wire_value()));
+            return Ok(Value::Dict(fields));
+        }
+        let empty_file = self.size == 0 && self.file_hash == [0; 20] && self.piece_count == 0;
+        if !empty_file {
+            fields.insert(b"hash".to_vec(), Value::bytes(self.file_hash));
+            fields.insert(b"npieces".to_vec(), Value::Int(self.piece_count as i64));
+        }
+        fields.insert(b"otime".to_vec(), Value::Int(self.otime));
+        fields.insert(b"owner".to_vec(), Value::bytes(self.owner));
+        fields.insert(b"path".to_vec(), Value::List(path));
+        fields.insert(b"perm".to_vec(), Value::Int(wire_mode));
+        fields.insert(b"size".to_vec(), Value::Int(self.size as i64));
+        fields.insert(b"state".to_vec(), Value::Int(self.state.wire_value()));
+        fields.insert(b"time".to_vec(), Value::Int(self.time_seconds));
+        fields.insert(b"type".to_vec(), Value::Int(self.entry_type.wire_value()));
+        Ok(Value::Dict(fields))
+    }
+
     pub fn metadata_hash(&self) -> [u8; 20] {
         Sha1::digest(encode(&self.main())).into()
     }
 
+    pub fn metadata_hash_for_wire(&self, encrypted: bool) -> Result<[u8; 20]> {
+        Ok(Sha1::digest(encode(&self.main_for_wire(encrypted)?)).into())
+    }
+
+    pub fn main_for_wire(&self, encrypted: bool) -> Result<Value> {
+        if encrypted {
+            self.encrypted_main
+                .clone()
+                .context("encrypted metadata main is missing")
+        } else {
+            Ok(self.plain_main())
+        }
+    }
+
     pub fn signed_file(&self, signing_key: &SigningKey, have: i64) -> Result<Value> {
-        let main = self.main();
-        let signature = signing_key.sign(&Sha1::digest(encode(&main)));
+        self.signed_file_for_wire(self.encrypted_main.is_some(), signing_key, have)
+    }
+
+    pub fn signed_file_for_wire(
+        &self,
+        encrypted: bool,
+        signing_key: &SigningKey,
+        have: i64,
+    ) -> Result<Value> {
+        let main = self.main_for_wire(encrypted)?;
+        // The signature must cover exactly the `main` published next to it.
+        let signature = self.signature_for_wire_with_form(signing_key, encrypted)?;
         let mut fields = BTreeMap::new();
         if self.entry_type == EntryType::RegularFile
             && self.state == EntryState::Active
@@ -299,8 +526,36 @@ impl FileMetadata {
             fields.insert(b"have".to_vec(), Value::Int(have));
         }
         fields.insert(b"main".to_vec(), main);
-        fields.insert(b"sig".to_vec(), Value::bytes(signature.to_bytes()));
+        fields.insert(b"sig".to_vec(), Value::bytes(signature));
         Ok(Value::Dict(fields))
+    }
+
+    pub fn signature_for_wire(&self, signing_key: &SigningKey) -> Result<Vec<u8>> {
+        self.signature_for_wire_with_form(signing_key, self.encrypted_main.is_some())
+    }
+
+    /// Upstream signs the *canonical* metadata of an encrypted folder, i.e. the
+    /// form carrying `epart` and the wrapped path, even when the wire form it
+    /// publishes next to the signature is the plaintext one. Both directions
+    /// rely on this: a peer that receives the plaintext form still expects the
+    /// signature to cover the encrypted form, and a peer that receives the
+    /// encrypted form verifies it against the same bytes.
+    ///
+    /// `encrypted` therefore only selects which `main` is published; the
+    /// signature always covers [`FileMetadata::main`].
+    pub fn signature_for_wire_with_form(
+        &self,
+        signing_key: &SigningKey,
+        _encrypted: bool,
+    ) -> Result<Vec<u8>> {
+        if !self.signature.is_empty() {
+            return Ok(self.signature.clone());
+        }
+        let main = self.main();
+        Ok(signing_key
+            .sign(&Sha1::digest(encode(&main)))
+            .to_bytes()
+            .to_vec())
     }
 
     pub fn torrent_metadata(&self) -> Value {
@@ -308,27 +563,126 @@ impl FileMetadata {
     }
 
     pub fn torrent_info(&self) -> Value {
-        let mut pieces = Vec::with_capacity(self.piece_hashes.len() * 20);
-        for piece in &self.piece_hashes {
+        self.torrent_info_with_wire_hashes(&self.piece_hashes, None)
+            .expect("legacy torrent metadata generation")
+    }
+
+    /// Build the torrent `info` dictionary for one file.
+    ///
+    /// `hashed_content` is the byte stream `pieces` must describe. Outside an
+    /// encrypted folder that is the content itself; inside one it is the
+    /// **ciphertext**, even when the `data` body sent to a read-only peer is
+    /// the plaintext. This was verified against official client 3.1.2, whose
+    /// own `meta` table stores `pieces` as the SHA-1 of the ciphertext while
+    /// `epieces` carries the AES-wrapped SHA-1 of the plaintext; the same meta
+    /// is reused verbatim for `E` and `F` peers. Hashing the plaintext here
+    /// made the peer reject the metadata with "Failed to verify metadata hash"
+    /// and ban the sender.
+    pub fn torrent_info_for_content(
+        &self,
+        hashed_content: &[u8],
+        content_key: Option<&[u8; 16]>,
+    ) -> Result<Value> {
+        let wire_piece_hashes = hashed_content
+            .chunks(PIECE_LENGTH as usize)
+            .map(|chunk| Sha1::digest(chunk).into())
+            .collect::<Vec<[u8; 20]>>();
+        if wire_piece_hashes.len() != self.piece_hashes.len() {
+            bail!("torrent piece hash count does not match content");
+        }
+        let info = self.torrent_info_with_wire_hashes(&wire_piece_hashes, content_key)?;
+        Ok(info)
+    }
+
+    fn torrent_info_with_wire_hashes(
+        &self,
+        wire_piece_hashes: &[[u8; 20]],
+        content_key: Option<&[u8; 16]>,
+    ) -> Result<Value> {
+        // An entry with no pieces has nothing to protect, so an encrypted
+        // folder publishes it exactly like a plain one: no `epieces` field.
+        let use_epieces = self.encrypted_epart.is_some() && !self.piece_hashes.is_empty();
+        let mut pieces = Vec::with_capacity(wire_piece_hashes.len() * 20);
+        for piece in wire_piece_hashes {
             pieces.extend_from_slice(piece);
         }
-        Value::dict([
-            (b"length".to_vec(), Value::Int(self.size as i64)),
-            (b"piece length".to_vec(), Value::Int(PIECE_LENGTH as i64)),
-            (b"pieces".to_vec(), Value::bytes(pieces)),
-            (b"rp".to_vec(), Value::bytes(self.random_prefix.clone())),
-        ])
+        let mut fields = BTreeMap::new();
+        if use_epieces {
+            let content_key = content_key.context("torrent epieces requires a content key")?;
+            fields.insert(
+                b"epieces".to_vec(),
+                Value::bytes(crate::encrypted_folder::encrypt_epieces(
+                    content_key,
+                    &self.piece_hashes,
+                )?),
+            );
+        }
+        fields.insert(b"length".to_vec(), Value::Int(self.size as i64));
+        fields.insert(b"piece length".to_vec(), Value::Int(PIECE_LENGTH as i64));
+        fields.insert(b"pieces".to_vec(), Value::bytes(pieces));
+        if !use_epieces {
+            fields.insert(b"rp".to_vec(), Value::bytes(self.random_prefix.clone()));
+        }
+        Ok(Value::Dict(fields))
     }
 
     pub fn content_message(&self, content: &[u8]) -> Result<Value> {
         self.verify_content(content)?;
+        self.content_message_unchecked(content)
+    }
+
+    pub fn content_message_unchecked(&self, content: &[u8]) -> Result<Value> {
+        self.content_message_unchecked_with_key(content, None)
+    }
+
+    /// The `data` + `meta` pair sent for one file.
+    ///
+    /// `data_bytes` is the body actually placed in `data` while
+    /// `hashed_bytes` is what `pieces` describes; they differ inside an
+    /// encrypted folder. Official client 3.1.2 publishes the *same* torrent
+    /// info to a read-only `E` peer and to an encrypted-only `F` peer — the
+    /// `meta` row of its storage database is byte-identical for both — and
+    /// only varies `data`: ciphertext for `F`, plaintext for `E`. `pieces`
+    /// therefore always covers the ciphertext, and `epieces` protects the
+    /// plaintext hashes so an `E` receiver can verify the plaintext body.
+    pub fn content_message_for_wire(
+        &self,
+        data_bytes: &[u8],
+        hashed_bytes: &[u8],
+        content_key: Option<&[u8; 16]>,
+    ) -> Result<Value> {
+        let info = self.torrent_info_for_content(hashed_bytes, content_key)?;
+        let meta_bytes = encode(&Value::dict([(b"info".to_vec(), info)]));
         Ok(Value::dict([
-            (b"data".to_vec(), Value::bytes(content)),
-            (
-                b"meta".to_vec(),
-                Value::Bytes(encode(&self.torrent_metadata())),
-            ),
+            (b"data".to_vec(), Value::bytes(data_bytes)),
+            (b"meta".to_vec(), Value::Bytes(meta_bytes)),
         ]))
+    }
+
+    pub fn content_message_unchecked_with_key(
+        &self,
+        content: &[u8],
+        content_key: Option<&[u8; 16]>,
+    ) -> Result<Value> {
+        let wire_data = self.metadata_content_for_wire(content, content_key)?;
+        self.content_message_for_wire(&wire_data, &wire_data, content_key)
+    }
+
+    pub fn metadata_content_for_wire(
+        &self,
+        content: &[u8],
+        content_key: Option<&[u8; 16]>,
+    ) -> Result<Vec<u8>> {
+        if self.encrypted_epart.is_none() {
+            return Ok(content.to_vec());
+        }
+        let content_key = content_key.context("encrypted metadata requires a content key")?;
+        crate::encrypted_folder::encrypt_content(
+            content_key,
+            &self.piece_hashes,
+            PIECE_LENGTH as usize,
+            content,
+        )
     }
 
     pub fn direct_login(
@@ -336,15 +690,31 @@ impl FileMetadata {
         share_id: &[u8; 20],
         peer_id: &[u8; 20],
         signing_key: &SigningKey,
+        encrypted_wire: bool,
+        encrypted_path: bool,
     ) -> Result<Vec<u8>> {
-        encode_direct_torrent(&self.direct_login_message(share_id, peer_id, signing_key)?)
+        encode_direct_torrent(&self.direct_login_message(
+            share_id,
+            peer_id,
+            signing_key,
+            encrypted_wire,
+            encrypted_path,
+        )?)
     }
 
+    /// `encrypted_wire` selects the info hash that identifies the torrent;
+    /// `encrypted_path` selects the name sent in `f`. They are not the same
+    /// flag: the name must be one the *responder* can look up in its own tree.
+    /// A `D`/`E` responder publishes plaintext names, while an encrypted-only
+    /// `F` responder holds only the encrypted ones, so asking it by plaintext
+    /// name makes the lookup fail and it closes the download connection.
     pub fn direct_login_message(
         &self,
         share_id: &[u8; 20],
         peer_id: &[u8; 20],
         signing_key: &SigningKey,
+        encrypted_wire: bool,
+        encrypted_path: bool,
     ) -> Result<Value> {
         let signature = if self.signature.is_empty() {
             signing_key
@@ -354,9 +724,17 @@ impl FileMetadata {
         } else {
             self.signature.clone()
         };
+        let path = if encrypted_path {
+            self.protocol_path_string()
+        } else {
+            self.wire_path_string()
+        };
         Ok(Value::dict([
-            (b"f".to_vec(), Value::bytes(self.wire_path())),
-            (b"i".to_vec(), Value::bytes(self.info_hash(share_id))),
+            (b"f".to_vec(), Value::bytes(path.into_bytes())),
+            (
+                b"i".to_vec(),
+                Value::bytes(self.info_hash_for_wire(share_id, encrypted_wire)),
+            ),
             (b"p".to_vec(), Value::bytes(*peer_id)),
             (b"s".to_vec(), Value::bytes(*share_id)),
             (b"sig".to_vec(), Value::bytes(signature)),
@@ -368,8 +746,15 @@ impl FileMetadata {
         share_id: &[u8; 20],
         peer_id: &[u8; 20],
         signing_key: &SigningKey,
+        encrypted_wire: bool,
     ) -> Result<Vec<u8>> {
-        encode_direct_torrent_body(&self.direct_login_message(share_id, peer_id, signing_key)?)
+        encode_direct_torrent_body(&self.direct_login_message(
+            share_id,
+            peer_id,
+            signing_key,
+            encrypted_wire,
+            encrypted_wire,
+        )?)
     }
 
     pub fn verify_content(&self, content: &[u8]) -> Result<()> {
@@ -402,9 +787,15 @@ impl FileMetadata {
         if pieces.len() / 20 != self.piece_hashes.len() {
             bail!("content has fewer pieces than metadata");
         }
-        let file_hash: [u8; 20] = Sha1::digest(&pieces).into();
-        if file_hash != self.file_hash {
-            bail!("file hash mismatch for {}", self.wire_path_string());
+        // `piece_hashes` always cover the local plaintext. A plain folder's
+        // `file_hash` is their SHA-1; an encrypted folder's is the info-hash of
+        // the torrent built from the ciphertext, so it is only derivable from
+        // the wire form and is checked by `torrent_file_hash` instead.
+        if self.encrypted_epart.is_none() {
+            let file_hash = standard_file_hash(self.piece_hashes.as_slice())?;
+            if file_hash != self.file_hash {
+                bail!("file hash mismatch for {}", self.wire_path_string());
+            }
         }
         Ok(())
     }
@@ -412,6 +803,21 @@ impl FileMetadata {
     pub fn wire_path_string(&self) -> String {
         self.relative_path.join("/")
     }
+
+    pub fn protocol_path_string(&self) -> String {
+        self.encrypted_path
+            .as_ref()
+            .unwrap_or(&self.relative_path)
+            .join("/")
+    }
+}
+
+pub(crate) fn standard_file_hash(piece_hashes: &[[u8; 20]]) -> Result<[u8; 20]> {
+    let mut input = Vec::with_capacity(piece_hashes.len().saturating_mul(20));
+    for piece_hash in piece_hashes {
+        input.extend_from_slice(piece_hash);
+    }
+    Ok(Sha1::digest(input).into())
 }
 
 pub fn encode_direct_torrent(value: &Value) -> Result<Vec<u8>> {
@@ -772,11 +1178,21 @@ pub fn decode_direct_torrent_body(payload: &[u8]) -> Result<Value> {
 }
 
 pub fn parse_file(value: &Value, public_key: &[u8; 32]) -> Result<FileMetadata> {
+    parse_file_with_key(value, public_key, None)
+}
+
+pub fn parse_file_with_key(
+    value: &Value,
+    public_key: &[u8; 32],
+    share_key: Option<&ShareKey>,
+) -> Result<FileMetadata> {
     let main = value.get(b"main")?;
     let signature = value.get(b"sig")?.as_bytes()?.to_vec();
-    verify_file_signature(public_key, main, &signature)?;
+    // Signature checking happens after the metadata is built: an encrypted
+    // folder publishes the plaintext wire form while signing the canonical
+    // encrypted one, so verification needs the decoded entry.
     let path = main.get(b"path")?;
-    let relative_path = path
+    let encrypted_path = path
         .as_list()?
         .iter()
         .map(|part| {
@@ -784,19 +1200,55 @@ pub fn parse_file(value: &Value, public_key: &[u8; 32]) -> Result<FileMetadata> 
             String::from_utf8(bytes.to_vec()).context("file path is not UTF-8")
         })
         .collect::<Result<Vec<_>>>()?;
+    let encrypted_epart = match main.as_dict()?.get(&b"epart"[..]) {
+        Some(value) => Some(value.as_bytes()?.to_vec()),
+        None => None,
+    };
+    let encrypted_folder = encrypted_epart.is_some();
+    let mut relative_path = encrypted_path.clone();
+    let mut protected_mtime = None;
+    let mut protected_mode = None;
+    let mut protected_type = None;
+    let mut protected_write_times = 0;
+    if let Some(epart) = &encrypted_epart {
+        if let Some(key) = share_key.filter(|key| key.can_encrypt()) {
+            let protected = crate::encrypted_folder::decrypt_epart(&key.encryption_key()?, epart)
+                .context("decrypt file epart")?;
+            let protected = crate::bencode::decode(&protected).context("parse file epart")?;
+            protected_mtime = Some(protected.get(b"mtime")?.as_int()?);
+            protected_mode = Some(protected.get(b"perm")?.as_int()?);
+            protected_type = Some(protected.get(b"type")?.as_int()?);
+            protected_write_times = match protected.as_dict()?.get(&b"write_times"[..]) {
+                Some(value) => value.as_int()?,
+                None => 0,
+            };
+            let content_key = key.encryption_key()?;
+            relative_path = crate::encrypted_folder::unwrap_path(&content_key, &encrypted_path)
+                .context("decrypt file path")?;
+        }
+    }
     let entry_type = match main.get(b"type")?.as_int()? {
         1 => EntryType::RegularFile,
         2 => EntryType::Directory,
         other => bail!("unsupported upstream entry type {other}"),
     };
+    if protected_type.is_some_and(|value| value != entry_type.wire_value()) {
+        bail!("encrypted file epart type differs from metadata type");
+    }
     let size = match entry_type {
         EntryType::RegularFile => main.get(b"size")?.as_int()?,
         EntryType::Directory => 0,
     };
-    let mode = main.get(b"perm")?.as_int()?;
-    let mtime_seconds = match entry_type {
-        EntryType::RegularFile => main.get(b"mtime")?.as_int()?,
-        EntryType::Directory => main.get(b"time")?.as_int()?,
+    // The encrypted wire form always advertises `0644`; the real mode lives in
+    // the protected epart. Without a decryptable epart keep the wire value.
+    let mode = protected_mode.unwrap_or(main.get(b"perm")?.as_int()?);
+    let mtime_seconds = match protected_mtime {
+        Some(value) => value,
+        None if encrypted_epart.is_some() => main.get(b"time")?.as_int()?,
+        None => match entry_type {
+            EntryType::RegularFile => main.get(b"mtime")?.as_int()?,
+            EntryType::Directory => main.get(b"time")?.as_int()?,
+        },
     };
     let time_seconds = main.get(b"time")?.as_int()?;
     let state = match main.get(b"state")?.as_int()? {
@@ -823,7 +1275,7 @@ pub fn parse_file(value: &Value, public_key: &[u8; 32]) -> Result<FileMetadata> 
         },
         EntryType::Directory => 0,
     };
-    Ok(FileMetadata {
+    let mut metadata = FileMetadata {
         relative_path,
         entry_type,
         size: size.try_into()?,
@@ -841,12 +1293,75 @@ pub fn parse_file(value: &Value, public_key: &[u8; 32]) -> Result<FileMetadata> 
             .try_into()
             .map_err(|_| anyhow::anyhow!("owner is not 20 bytes"))?,
         otime: main.get(b"otime")?.as_int()?,
-        write_times: match main.as_dict()?.get(&b"write_times"[..]) {
+        write_times: protected_write_times.max(match main.as_dict()?.get(&b"write_times"[..]) {
             Some(value) => value.as_int()?,
             None => 0,
-        },
-        signature,
-    })
+        }),
+        signature: signature.clone(),
+        encrypted_path: encrypted_folder.then_some(encrypted_path),
+        encrypted_epart,
+        encrypted_main: encrypted_folder.then(|| main.clone()),
+    };
+
+    // A signature only covers the exact `main` dictionary published next to
+    // it. Peers may present either the canonical encrypted form (active
+    // encrypted entries) or the plaintext form (tombstones and entries whose
+    // wire form was rewritten by a relay), so try both before failing.
+    if encrypted_folder {
+        let canonical_result = verify_file_signature(public_key, main, &signature);
+        let plain_main = metadata.plain_main();
+        let plain_result = verify_file_signature(public_key, &plain_main, &signature);
+        if canonical_result.is_err() && plain_result.is_ok() {
+            metadata.signature = signature;
+        } else {
+            canonical_result?;
+        }
+    } else {
+        let plain_result = verify_file_signature(public_key, main, &signature);
+        if plain_result.is_err() && share_key.is_some_and(|key| key.can_encrypt()) {
+            let key = share_key.unwrap();
+            let original_mtime = metadata.mtime_seconds;
+            let original_write_times = metadata.write_times;
+            let mut verified = false;
+            let mut canonical = metadata.clone();
+            canonical.prepare_encrypted(key)?;
+            let canonical_result = verify_file_signature(public_key, &canonical.main(), &signature);
+            if canonical_result.is_ok() {
+                metadata = canonical;
+                metadata.signature = signature.clone();
+                verified = true;
+            }
+            // Upstream is not consistent about which timestamp the protected
+            // epart carries, so accept any combination it could have signed.
+            for mtime_seconds in [metadata.mtime_seconds, metadata.time_seconds] {
+                for write_times in [original_write_times, 0] {
+                    let mut candidate = metadata.clone();
+                    candidate.mtime_seconds = mtime_seconds;
+                    candidate.write_times = write_times;
+                    candidate.prepare_encrypted(key)?;
+                    let candidate_result =
+                        verify_file_signature(public_key, &candidate.main(), &signature);
+                    if candidate_result.is_ok() {
+                        candidate.mtime_seconds = original_mtime;
+                        candidate.write_times = original_write_times;
+                        candidate.signature = signature.clone();
+                        metadata = candidate;
+                        verified = true;
+                        break;
+                    }
+                }
+                if verified {
+                    break;
+                }
+            }
+            if !verified {
+                plain_result?;
+            }
+        } else {
+            plain_result?;
+        }
+    }
+    Ok(metadata)
 }
 
 pub fn parse_content(value: &Value) -> Result<(Vec<u8>, TorrentMetadata)> {
@@ -874,36 +1389,82 @@ pub fn parse_torrent_info(info: &Value) -> Result<TorrentMetadata> {
                 .map_err(|_| anyhow::anyhow!("piece hash is not 20 bytes"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let random_prefix = info.get(b"rp")?.as_bytes()?.to_vec();
-    let expected_prefix_length = piece_hashes
-        .len()
-        .checked_mul(4)
-        .context("torrent random prefix length overflow")?;
-    if random_prefix.len() != expected_prefix_length {
-        bail!("torrent rp is not {} bytes", expected_prefix_length);
+    let epieces = info
+        .get(b"epieces")
+        .ok()
+        .map(|value| value.as_bytes().map(|value| value.to_vec()))
+        .transpose()?;
+    let random_prefix = info
+        .get(b"rp")
+        .ok()
+        .map(|value| value.as_bytes().map(|value| value.to_vec()))
+        .transpose()?;
+    let random_prefix = match (epieces.as_ref(), random_prefix) {
+        (Some(_), Some(_)) => bail!("torrent has both epieces and rp"),
+        (Some(_), None) => Vec::new(),
+        (None, Some(random_prefix)) => {
+            let expected_prefix_length = piece_hashes
+                .len()
+                .checked_mul(4)
+                .context("torrent random prefix length overflow")?;
+            if random_prefix.len() != expected_prefix_length {
+                bail!("torrent rp is not {} bytes", expected_prefix_length);
+            }
+            random_prefix
+        }
+        (None, None) => {
+            if !piece_hashes.is_empty() {
+                bail!("torrent contains no piece hashes");
+            }
+            Vec::new()
+        }
+    };
+    if let Some(epieces) = &epieces {
+        if epieces.len() <= 16 || (epieces.len() - 16) % 16 != 0 {
+            bail!("torrent epieces has an invalid length");
+        }
+        let expected_epieces_len =
+            crate::encrypted_folder::encrypted_epieces_len(piece_hashes.len());
+        if epieces.len() != expected_epieces_len {
+            bail!("torrent epieces is not {} bytes", expected_epieces_len);
+        }
     }
     Ok(TorrentMetadata {
         size: info.get(b"length")?.as_int()?.try_into()?,
         piece_length: piece_length.try_into()?,
         piece_hashes,
         random_prefix,
+        epieces: epieces.unwrap_or_default(),
     })
 }
 
 pub fn expected_torrent_info_size(size: u64, piece_count: usize) -> Result<usize> {
+    expected_torrent_info_size_for_shape(size, piece_count, false)
+}
+
+pub fn expected_torrent_info_size_for_shape(
+    size: u64,
+    piece_count: usize,
+    use_epieces: bool,
+) -> Result<usize> {
     let pieces_len = piece_count
         .checked_mul(20)
         .context("torrent piece count overflow")?;
-    let random_prefix_len = piece_count
-        .checked_mul(4)
-        .context("torrent random prefix count overflow")?;
-    let info = Value::dict([
-        (b"length".to_vec(), Value::Int(size as i64)),
-        (b"piece length".to_vec(), Value::Int(PIECE_LENGTH as i64)),
-        (b"pieces".to_vec(), Value::Bytes(vec![0_u8; pieces_len])),
-        (b"rp".to_vec(), Value::Bytes(vec![0_u8; random_prefix_len])),
-    ]);
-    Ok(encode(&info).len())
+    let mut fields = BTreeMap::new();
+    if use_epieces {
+        let epieces_len = crate::encrypted_folder::encrypted_epieces_len(piece_count);
+        fields.insert(b"epieces".to_vec(), Value::Bytes(vec![0_u8; epieces_len]));
+    }
+    fields.insert(b"length".to_vec(), Value::Int(size as i64));
+    fields.insert(b"piece length".to_vec(), Value::Int(PIECE_LENGTH as i64));
+    fields.insert(b"pieces".to_vec(), Value::Bytes(vec![0_u8; pieces_len]));
+    if !use_epieces {
+        let random_prefix_len = piece_count
+            .checked_mul(4)
+            .context("torrent random prefix count overflow")?;
+        fields.insert(b"rp".to_vec(), Value::Bytes(vec![0_u8; random_prefix_len]));
+    }
+    Ok(encode(&Value::Dict(fields)).len())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -912,9 +1473,34 @@ pub struct TorrentMetadata {
     pub piece_length: u64,
     pub piece_hashes: Vec<[u8; 20]>,
     pub random_prefix: Vec<u8>,
+    pub epieces: Vec<u8>,
 }
 
 impl TorrentMetadata {
+    pub fn file_hash(&self) -> Result<[u8; 20]> {
+        if self.size == 0 && self.piece_hashes.is_empty() {
+            return Ok([0; 20]);
+        }
+        if !self.epieces.is_empty() {
+            let mut fields = BTreeMap::new();
+            fields.insert(b"epieces".to_vec(), Value::bytes(self.epieces.clone()));
+            fields.insert(b"length".to_vec(), Value::Int(self.size as i64));
+            fields.insert(
+                b"piece length".to_vec(),
+                Value::Int(self.piece_length as i64),
+            );
+            let mut pieces = Vec::with_capacity(self.piece_hashes.len() * 20);
+            for piece_hash in &self.piece_hashes {
+                pieces.extend_from_slice(piece_hash);
+            }
+            fields.insert(b"pieces".to_vec(), Value::bytes(pieces));
+            let metadata = Value::dict([(b"info".to_vec(), Value::Dict(fields))]);
+            Ok(Sha1::digest(encode(&metadata)).into())
+        } else {
+            standard_file_hash(&self.piece_hashes)
+        }
+    }
+
     pub fn verify(&self, content: &[u8]) -> Result<()> {
         if content.len() as u64 != self.size {
             bail!("torrent content length mismatch");
@@ -1299,6 +1885,9 @@ mod tests {
             otime: 10,
             write_times: 2,
             signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
         }
     }
 
@@ -1382,6 +1971,9 @@ mod tests {
             otime: 7,
             write_times: 2,
             signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
         };
         metadata.file_hash = Sha1::digest(metadata.piece_hashes[0]).into();
         let share = [8; 20];
@@ -1390,6 +1982,109 @@ mod tests {
         expected.update(b"nested\0file.bin");
         expected.update(metadata.file_hash);
         assert_eq!(metadata.info_hash(&share), expected.finalize().as_slice());
+    }
+
+    #[test]
+    fn standard_multi_piece_file_hash_concatenates_piece_hashes() {
+        let metadata = FileMetadata {
+            relative_path: vec!["multi.bin".into()],
+            size: 70_000,
+            mode: 0o644,
+            mtime_seconds: 1,
+            time_seconds: 1,
+            state: EntryState::Active,
+            entry_type: EntryType::RegularFile,
+            file_hash: [0; 20],
+            piece_count: 3,
+            piece_hashes: vec![[1; 20], [2; 20], [3; 20]],
+            random_prefix: vec![0; 12],
+            owner: [6; 20],
+            otime: 7,
+            write_times: 2,
+            signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
+        };
+        let torrent = parse_torrent_info(&metadata.torrent_info()).unwrap();
+        let mut expected_input = Vec::new();
+        expected_input.extend_from_slice(&[1; 20]);
+        expected_input.extend_from_slice(&[2; 20]);
+        expected_input.extend_from_slice(&[3; 20]);
+        assert_eq!(
+            torrent.file_hash().unwrap().as_slice(),
+            Sha1::digest(expected_input).as_slice()
+        );
+        assert_eq!(torrent.random_prefix, vec![0; 12]);
+        assert!(torrent.epieces.is_empty());
+    }
+
+    #[test]
+    fn encrypted_multi_piece_metadata_matches_official_fixture() {
+        let key = ShareKey::parse("DJMJ5MWYMBKS5SCWMBRQ7LXBGZAQGLSAQ").unwrap();
+        let plain_hashes = [
+            hex::decode("d47de169151cf65d085423d15540a95242871fba")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            hex::decode("3d00efee58abc0e78cd7525abac6b9bcba119fa7")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            hex::decode("cda88b27b204b60d615f897acfc80fd085d926e4")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ];
+        let wire_hashes = [
+            hex::decode("c090bcd6206df365cfb4651bca1d244355c2b0cf")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            hex::decode("c1d3687b123c5d96514aac757e853a965795b737")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            hex::decode("d70ef447ba207ed8b6365b2a13682614f4ead30c")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ];
+        let metadata = FileMetadata {
+            relative_path: vec!["multi.bin".into()],
+            size: 70_000,
+            mode: 0o644,
+            mtime_seconds: 1,
+            time_seconds: 1,
+            state: EntryState::Active,
+            entry_type: EntryType::RegularFile,
+            file_hash: [0; 20],
+            piece_count: 3,
+            piece_hashes: plain_hashes.to_vec(),
+            random_prefix: Vec::new(),
+            owner: [6; 20],
+            otime: 7,
+            write_times: 2,
+            signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: Some(Vec::new()),
+            encrypted_main: None,
+        };
+        let info = metadata
+            .torrent_info_with_wire_hashes(&wire_hashes, Some(&key.encryption_key().unwrap()))
+            .unwrap();
+        // The file hash covers the bencoded `{"info": …}` wrapper, which is
+        // what the fixture below pins.
+        let encoded = encode(&Value::dict([(b"info".to_vec(), info.clone())]));
+        assert_eq!(
+            hex::encode(&encoded),
+            "64343a696e666f64373a6570696563657338303a24110525987be1d5cc352dbea6bdc1bf0621f29b662aaadcf23b2006d9b48bdd35d7dd0b8cfc19ee063fbf851a8bc6199e8bf7adcd4a5450bc3ed985e603ae97efccd9041909dd0015189d4357da16dd363a6c656e6774686937303030306531323a7069656365206c656e67746869333237363865363a70696563657336303ac090bcd6206df365cfb4651bca1d244355c2b0cfc1d3687b123c5d96514aac757e853a965795b737d70ef447ba207ed8b6365b2a13682614f4ead30c6565"
+        );
+        let torrent = parse_torrent_info(&info).unwrap();
+        assert_eq!(
+            hex::encode(torrent.file_hash().unwrap()),
+            "5c6c7deecfb6257dfd7742de867c95e676b06211"
+        );
     }
 
     #[test]
@@ -1413,12 +2108,255 @@ mod tests {
             otime: 2,
             write_times: 2,
             signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
         };
         let file = metadata.signed_file(&signing_key, 1).unwrap();
         let parsed = parse_file(&file, &public_key).unwrap();
         assert_eq!(parsed.file_hash, metadata.file_hash);
         let (content, torrent) = parse_content(&metadata.content_message(b"x").unwrap()).unwrap();
         torrent.verify(&content).unwrap();
+    }
+
+    #[test]
+    fn encrypted_metadata_matches_official_fixture_and_key_roles() {
+        let read_write = ShareKey::parse("DJMJ5MWYMBKS5SCWMBRQ7LXBGZAQGLSAQ").unwrap();
+        let read_only =
+            ShareKey::parse("EH5L5UOAVPTVUQTRQRVGFD5XGUQB5B6ZDZR47LKBWQANFZSCU5CTMTFG3CI").unwrap();
+        let encrypted_only = ShareKey::parse("FH5L5UOAVPTVUQTRQRVGFD5XGUQB5B6ZD").unwrap();
+        let mut metadata = FileMetadata {
+            relative_path: vec!["sample.bin".to_owned()],
+            entry_type: EntryType::RegularFile,
+            size: 21,
+            mode: 420,
+            mtime_seconds: 1790774110,
+            time_seconds: 1790774110,
+            state: EntryState::Active,
+            file_hash: [
+                0x81, 0x88, 0x38, 0x1a, 0x8e, 0x6c, 0x99, 0xc2, 0x7c, 0xe6, 0xf1, 0x74, 0x08, 0x39,
+                0x32, 0x06, 0x98, 0xa9, 0x9f, 0xac,
+            ],
+            piece_hashes: vec![hex::decode("7159b85339d6e567ef2bf01c09afbc3a68442b0d")
+                .unwrap()
+                .try_into()
+                .unwrap()],
+            piece_count: 1,
+            random_prefix: vec![0; 4],
+            owner: [
+                0x20, 0xb2, 0x43, 0x66, 0x12, 0xec, 0xbd, 0x88, 0x2c, 0xe7, 0xd6, 0x5e, 0xda, 0xed,
+                0x15, 0xa9, 0xb4, 0xee, 0xa5, 0x9a,
+            ],
+            otime: 5,
+            write_times: 2,
+            signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
+        };
+        metadata
+            .prepare_encrypted_with_content(&read_write, b"hello sample metadata")
+            .unwrap();
+        let main = metadata.main();
+        assert_eq!(
+            hex::encode(encode(&main)),
+            "64353a657061727437323a4877baa041bd5a99795bd5cec6b1fd07e57e30754bb21d2965d300ff170c1ed3d9683b8e96a247d011ac5ecde716c795f3d34af0d703bf87805f34e21aad4fe9060d84836d152797343a6861736832303a8188381a8e6c99c27ce6f1740839320698a99fac373a6e706965636573693165353a6f74696d65693565353a6f776e657232303a20b2436612ecbd882ce7d65edaed15a9b4eea59a343a706174686c33393a594248375a324d594b5459543554544c56435755354d46423351585950354955574f52364b454165343a7065726d6934323065343a73697a6569323165353a7374617465693165343a74696d65693137393037373431313065343a7479706569316565"
+        );
+        assert_eq!(
+            hex::encode(Sha1::digest(encode(&main))),
+            "3ae0234a8499cd473f6f43c840d2477ce03edc9b"
+        );
+        assert_eq!(
+            hex::encode(metadata.info_hash(&read_write.share_id())).to_uppercase(),
+            "A1055DBA7D8AA6455F21D58778E6537B7D1300EA"
+        );
+
+        let signing_key = read_write.ed25519_signing_key().unwrap();
+        let public_key = read_write.ed25519_public_key().unwrap();
+        let file = metadata.signed_file(&signing_key, 1).unwrap();
+        let plain_file = metadata
+            .signed_file_for_wire(false, &signing_key, 1)
+            .unwrap();
+        assert!(plain_file
+            .get(b"main")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(&b"epart"[..])
+            .is_none());
+        let parsed_plain =
+            parse_file_with_key(&plain_file, &public_key, Some(&read_write)).unwrap();
+        assert_eq!(parsed_plain.encrypted_main.as_ref().unwrap(), &main);
+        verify_file_signature(
+            &public_key,
+            parsed_plain.encrypted_main.as_ref().unwrap(),
+            plain_file.get(b"sig").unwrap().as_bytes().unwrap(),
+        )
+        .unwrap();
+        for key in [&read_write, &read_only, &encrypted_only] {
+            let parsed = parse_file_with_key(&file, &public_key, Some(key)).unwrap();
+            assert_eq!(parsed.encrypted_main.as_ref().unwrap(), &main);
+            assert_eq!(parsed.encrypted_epart.as_ref().unwrap().len(), 72);
+            if key.is_encrypted_only() {
+                assert_eq!(
+                    parsed.relative_path,
+                    vec!["YBH7Z2MYKTYT5TTLVCWU5MFB3QXYP5IUWOR6KEA".to_owned()]
+                );
+            } else {
+                assert_eq!(parsed.relative_path, vec!["sample.bin".to_owned()]);
+                assert_eq!(parsed.mtime_seconds, 1790774110);
+            }
+        }
+    }
+
+    #[test]
+    fn published_metadata_hash_matches_the_bytes_the_piece_protocol_serves() {
+        // Regression: an encrypted folder used to publish the torrent info of
+        // the *served* body. A `D`/`E` receiver is served plaintext but derives
+        // `file_hash` from the ciphertext torrent, so it answered every
+        // metadata request with "unable to parse meta ... Failed to verify
+        // metadata hash" and the update never completed. The published info
+        // must always describe the ciphertext, while the piece protocol serves
+        // whatever the receiver can consume.
+        use crate::secret::ShareKey;
+        let read_write = ShareKey::parse("DJMJ5MWYMBKS5SCWMBRQ7LXBGZAQGLSAQ").unwrap();
+        let content_key = read_write.encryption_key().unwrap();
+        let plaintext: Vec<u8> = (0..90_000_u32).map(|value| value as u8).collect();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), &plaintext).unwrap();
+        let mut metadata = FileMetadata::from_path(source.path(), "multi.bin", [1_u8; 20]).unwrap();
+        metadata
+            .prepare_encrypted_with_content(&read_write, &plaintext)
+            .unwrap();
+
+        let ciphertext = crate::encrypted_folder::encrypt_content(
+            &read_write.encryption_key().unwrap(),
+            &metadata.piece_hashes,
+            PIECE_LENGTH as usize,
+            &plaintext,
+        )
+        .unwrap();
+
+        // What a `D`/`E` receiver is served, and what `ut_metadata` publishes.
+        let served = plaintext.clone();
+        let published = metadata
+            .torrent_info_for_content(&ciphertext, Some(&content_key))
+            .unwrap();
+        let published = parse_torrent_info(&published).unwrap();
+        assert_eq!(
+            hex::encode(published.file_hash().unwrap()),
+            hex::encode(metadata.file_hash),
+            "the published info must reproduce the announced file hash"
+        );
+        let first_piece = PIECE_LENGTH as usize;
+        assert_eq!(
+            hex::encode(Sha1::digest(&ciphertext[..first_piece])),
+            hex::encode(published.piece_hashes[0])
+        );
+        assert_ne!(
+            hex::encode(Sha1::digest(&served[..first_piece])),
+            hex::encode(published.piece_hashes[0]),
+            "serving plaintext while advertising ciphertext hashes is the bug"
+        );
+
+        // The `epieces` layer still carries the plaintext hashes, which is how
+        // the receiver validates the plaintext it actually stored.
+        let epieces =
+            crate::encrypted_folder::decrypt_epieces(&content_key, &published.epieces).unwrap();
+        assert_eq!(
+            hex::encode(epieces[0]),
+            hex::encode(metadata.piece_hashes[0]),
+            "epieces must keep describing the plaintext hashes"
+        );
+    }
+
+    #[test]
+    fn encrypted_torrent_pieces_describe_ciphertext_for_every_reader_role() {
+        // Official client 3.1.2 publishes one torrent info per encrypted file
+        // and hashes the *ciphertext* into `pieces`, then reuses that meta
+        // verbatim for a read-only `E` peer (which receives the plaintext body)
+        // and for an encrypted-only `F` peer (which receives the ciphertext).
+        // Reproducing it requires hashing the encrypted bytes while still being
+        // able to send either body.
+        let read_write = ShareKey::parse("DJMJ5MWYMBKS5SCWMBRQ7LXBGZAQGLSAQ").unwrap();
+        let content_key = read_write.encryption_key().unwrap();
+        let plaintext = b"hello sample metadata";
+        let ciphertext = crate::encrypted_folder::encrypt_content(
+            &content_key,
+            &[Sha1::digest(plaintext).into()],
+            PIECE_LENGTH as usize,
+            plaintext,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(&ciphertext),
+            "f5b3ceaa2ffd4c720db685170ce3e30c89831673b7"
+        );
+
+        let mut metadata = FileMetadata {
+            relative_path: vec!["sample.bin".to_owned()],
+            entry_type: EntryType::RegularFile,
+            size: 21,
+            mode: 420,
+            mtime_seconds: 1790774110,
+            time_seconds: 1790774110,
+            state: EntryState::Active,
+            file_hash: [0; 20],
+            piece_hashes: vec![Sha1::digest(plaintext).into()],
+            piece_count: 1,
+            random_prefix: vec![0; 4],
+            owner: [0x20; 20],
+            otime: 5,
+            write_times: 2,
+            signature: Vec::new(),
+            encrypted_path: None,
+            encrypted_epart: None,
+            encrypted_main: None,
+        };
+        metadata
+            .prepare_encrypted_with_content(&read_write, plaintext)
+            .unwrap();
+
+        // The torrent hashes the ciphertext even though `piece_hashes` -- and
+        // the `epieces` field -- protect the plaintext.
+        let info = metadata
+            .torrent_info_for_content(&ciphertext, Some(&content_key))
+            .unwrap();
+        let torrent = parse_torrent_info(&info).unwrap();
+        assert_eq!(
+            hex::encode(Sha1::digest(&ciphertext)),
+            hex::encode(torrent.piece_hashes[0])
+        );
+        assert_ne!(
+            hex::encode(torrent.piece_hashes[0]),
+            hex::encode(metadata.piece_hashes[0]),
+            "pieces must describe the ciphertext, not the plaintext"
+        );
+        assert_eq!(
+            hex::encode(torrent.file_hash().unwrap()),
+            hex::encode(metadata.file_hash)
+        );
+
+        // An `F` reader gets the ciphertext body; a `D`/`E` reader the
+        // plaintext one. Both are described by the very same meta.
+        let for_encrypted_only = metadata
+            .content_message_for_wire(&ciphertext, &ciphertext, Some(&content_key))
+            .unwrap();
+        let for_read_only = metadata
+            .content_message_for_wire(plaintext, &ciphertext, Some(&content_key))
+            .unwrap();
+        assert_eq!(
+            for_encrypted_only.get(b"meta").unwrap().as_bytes().unwrap(),
+            for_read_only.get(b"meta").unwrap().as_bytes().unwrap()
+        );
+        assert_eq!(
+            parse_content(&for_encrypted_only).unwrap().0,
+            ciphertext.as_slice()
+        );
+        assert_eq!(
+            parse_content(&for_read_only).unwrap().0,
+            plaintext.as_slice()
+        );
     }
 
     #[test]
@@ -1618,6 +2556,75 @@ mod tests {
             decoded.get(b"v").unwrap().as_bytes().unwrap(),
             PEER_MESSAGE_PROTOCOL_VERSION.as_bytes()
         );
+    }
+
+    #[test]
+    fn read_only_peer_identity_without_pk_is_accepted() {
+        // Official 3.1.2 omits `pk` from `m=id` when it holds a read-only key,
+        // because such a peer has no Ed25519 identity. Rejecting the message
+        // drops a legitimate connection, so the field must be optional.
+        let message = Value::dict([
+            (b"m".to_vec(), Value::bytes(b"id")),
+            (b"name".to_vec(), Value::bytes("official-read-only")),
+            (b"peer".to_vec(), Value::bytes([0x11_u8; 20])),
+            (b"share".to_vec(), Value::bytes([0x22_u8; 20])),
+            (b"tags".to_vec(), Value::List(Vec::new())),
+            (b"v".to_vec(), Value::bytes(b"1")),
+        ]);
+        let key = peer_identity_key(&message).unwrap();
+        assert_eq!(key, [0_u8; 32]);
+        assert!(peer_key_cannot_sign(&key));
+    }
+
+    #[test]
+    fn writable_peer_identity_keeps_its_pk() {
+        let key =
+            ShareKey::parse(&format!("D{}", crate::secret::encode_base32(&[9_u8; 20]))).unwrap();
+        let identity = PeerIdentity::from_key("writable", &key, [0x33; 20]).unwrap();
+        let advertised = peer_identity_key(&identity.id_message()).unwrap();
+        assert_eq!(advertised, key.ed25519_public_key().unwrap());
+        assert!(!peer_key_cannot_sign(&advertised));
+    }
+
+    #[test]
+    fn relay_identity_message_announces_the_supplied_key() {
+        let key =
+            ShareKey::parse(&format!("A{}", crate::secret::encode_base32(&[3_u8; 20]))).unwrap();
+        let identity = PeerIdentity::from_key("relay", &key, [0x44; 20]).unwrap();
+        let writer_key = [0x77_u8; 32];
+        let relayed = identity.id_message_with_key(writer_key);
+        assert_eq!(
+            relayed.get(b"pk").unwrap().as_bytes().unwrap(),
+            writer_key.as_slice()
+        );
+        // The relay keeps its own peer id and share id; only `pk` changes.
+        assert_eq!(
+            relayed.get(b"peer").unwrap().as_bytes().unwrap(),
+            [0x44_u8; 20].as_slice()
+        );
+        assert_eq!(
+            relayed.get(b"share").unwrap().as_bytes().unwrap(),
+            key.share_id().as_slice()
+        );
+        // The default message still carries the node's own key.
+        assert_eq!(
+            identity
+                .id_message()
+                .get(b"pk")
+                .unwrap()
+                .as_bytes()
+                .unwrap(),
+            key.ed25519_public_key().unwrap().as_slice()
+        );
+    }
+
+    #[test]
+    fn malformed_peer_identity_key_is_rejected() {
+        let message = Value::dict([
+            (b"m".to_vec(), Value::bytes(b"id")),
+            (b"pk".to_vec(), Value::bytes(vec![1_u8; 7])),
+        ]);
+        assert!(peer_identity_key(&message).is_err());
     }
 
     #[test]

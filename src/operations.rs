@@ -115,24 +115,66 @@ pub fn pull_tree(request: PullRequest) -> Result<PullResponse> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GenerateKeyRequest {
+    #[serde(default)]
     pub read_write: bool,
+    #[serde(default)]
+    pub key_family: Option<String>,
+    /// Derive a linked role from this existing key instead of generating one.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Role to derive: `read-write`, `read-only`, or `encrypted`.
+    #[serde(default)]
+    pub derive: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GenerateKeyResponse {
     pub key: String,
     pub key_type: char,
+    pub access: String,
+    pub derived_keys: crate::secret::DerivedShareKeys,
 }
 
 pub fn generate_key(request: GenerateKeyRequest) -> Result<GenerateKeyResponse> {
-    let key = if request.read_write {
-        ShareKey::generate_read_write()
+    let key = if let Some(source) = request.from.as_deref() {
+        let source = ShareKey::parse(source)?;
+        match request.derive.as_deref() {
+            None | Some("read-only") => source.read_only_link_key()?,
+            Some("encrypted") => source.encrypted_link_key()?,
+            Some("read-write") => {
+                if !source.is_read_write() {
+                    bail!(
+                        "{} keys cannot derive a read-write link key",
+                        source.key_type
+                    );
+                }
+                source
+            }
+            Some(other) => bail!("unsupported derived key role {other}"),
+        }
     } else {
-        ShareKey::generate_read_only()
+        match (request.read_write, request.key_family.as_deref()) {
+            (false, None | Some("standard")) => ShareKey::generate_read_only(),
+            (false, Some(other)) => {
+                bail!("read-only generation only supports the standard key family, got {other}")
+            }
+            (true, None | Some("encrypt-capable") | Some("encrypted")) => {
+                ShareKey::generate_encrypt_capable_read_write()
+            }
+            (true, Some("standard")) => ShareKey::generate_standard_read_write(),
+            (true, Some(other)) => bail!("unsupported key family {other}"),
+        }
     };
     Ok(GenerateKeyResponse {
         key: key.render(),
         key_type: key.key_type,
+        access: match key.key_type {
+            'A' | 'D' => "read-write",
+            'F' => "encrypted-only",
+            _ => "read-only",
+        }
+        .to_owned(),
+        derived_keys: key.derived_keys(),
     })
 }
 
@@ -145,9 +187,20 @@ pub fn inspect_key(request: InspectKeyRequest) -> Result<serde_json::Value> {
     let key = ShareKey::parse(&request.key)?;
     Ok(serde_json::json!({
         "key_type": key.key_type,
+        "access": match key.key_type {
+            'A' | 'D' => "read-write",
+            'F' => "encrypted-only",
+            _ => "read-only",
+        },
+        "family": match key.family() {
+            crate::secret::ShareKeyFamily::Standard => "standard",
+            crate::secret::ShareKeyFamily::EncryptCapable => "encrypt-capable",
+        },
         "share_id": hex::encode(key.share_id()),
         "tls_identity": key.tls_identity(),
         "tls_psk_available": key.tls_psk().is_ok(),
+        "can_encrypt": key.can_encrypt(),
+        "derived_keys": key.derived_keys(),
     }))
 }
 

@@ -91,14 +91,13 @@
             <label>
               添加方式
               <select id="folder-link-mode">
-                <option value="generate-rw">生成新的读写链接</option>
-                <option value="generate-ro">生成新的只读链接</option>
-                <option value="import">导入已有链接</option>
+                <option value="generate-rw">生成读写密钥</option>
+                <option value="import">填入已有密钥或链接</option>
               </select>
             </label>
             <label id="folder-link-field" class="hidden">
-              读写 / 只读共享链接
-              <input id="folder-link" spellcheck="false" autocomplete="off" placeholder="rustsync://... 或原始 A/B/D/E 密钥">
+              已有共享密钥或链接
+              <input id="folder-link" spellcheck="false" autocomplete="off" placeholder="rustsync://... 或原始 A/B/D/E/F 密钥">
             </label>
             <label>
               同步节点
@@ -131,8 +130,8 @@
           <div class="tools-grid">
             <form id="generate-key-form">
               <label class="checkbox-label">
-                <input id="read-write-key" type="checkbox">
-                生成可写 A 密钥
+                <input id="read-write-key" type="checkbox" checked>
+                生成读写密钥（D，可派生只读/加密密钥）
               </label>
               <button class="secondary-button" type="submit">生成密钥</button>
             </form>
